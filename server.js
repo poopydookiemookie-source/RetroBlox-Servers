@@ -34,6 +34,33 @@ function saveGamesIndex() {
     }
 }
 
+// ================= ACCOUNT STORAGE SETUP =================
+const ACCOUNTS_INDEX_FILE = path.join(DATA_DIR, 'accounts.json');
+
+let accounts = [];
+try {
+    accounts = JSON.parse(fs.readFileSync(ACCOUNTS_INDEX_FILE, 'utf8'));
+} catch (e) {
+    accounts = [];
+}
+
+function saveAccountsIndex() {
+    try {
+        fs.writeFileSync(ACCOUNTS_INDEX_FILE, JSON.stringify(accounts, null, 2));
+    } catch (e) {
+        console.error('Failed to save accounts index:', e);
+    }
+}
+
+function findAccountByUsername(username) {
+    const lower = (username || '').toString().toLowerCase();
+    return accounts.find(a => a.username.toLowerCase() === lower);
+}
+
+function hashPassword(password, salt) {
+    return crypto.scryptSync(password, salt, 64).toString('hex');
+}
+
 // Public-safe view of a game (no need to strip much, but keep it explicit)
 function publicGame(g) {
     return {
@@ -179,6 +206,80 @@ app.get('/games/:id/vote-status', (req, res) => {
     else if (Array.isArray(g.dislikedBy) && g.dislikedBy.includes(userId)) vote = 'dislike';
 
     res.json({ vote, likes: g.likes, dislikes: g.dislikes });
+});
+
+// ================= ACCOUNTS =================
+
+// ---- Sign up a new account ----
+app.post('/accounts/signup', (req, res) => {
+    try {
+        const username = (req.body.username || '').toString().trim();
+        const password = (req.body.password || '').toString();
+        const birthday = (req.body.birthday || '').toString();
+        const gender = (req.body.gender || '').toString();
+
+        if (!username || username.length <= 3) {
+            return res.status(400).json({ error: 'invalid-username', message: 'Username must be more than 3 characters.' });
+        }
+        if (!password || password.length < 8) {
+            return res.status(400).json({ error: 'invalid-password', message: 'Password must be at least 8 characters.' });
+        }
+        if (!birthday) {
+            return res.status(400).json({ error: 'invalid-birthday', message: 'Birthday is required.' });
+        }
+        if (findAccountByUsername(username)) {
+            return res.status(409).json({ error: 'username-taken', message: 'That username is already taken.' });
+        }
+
+        const salt = crypto.randomBytes(16).toString('hex');
+        const passwordHash = hashPassword(password, salt);
+
+        const account = {
+            username,
+            salt,
+            passwordHash,
+            birthday,
+            gender,
+            createdAt: Date.now()
+        };
+
+        accounts.push(account);
+        saveAccountsIndex();
+
+        res.json({ success: true, username: account.username, birthday: account.birthday, gender: account.gender });
+    } catch (err) {
+        console.error('Signup error:', err);
+        res.status(500).json({ error: 'signup-failed', message: 'Something went wrong creating your account.' });
+    }
+});
+
+// ---- Log in to an existing account ----
+app.post('/accounts/login', (req, res) => {
+    try {
+        const username = (req.body.username || '').toString().trim();
+        const password = (req.body.password || '').toString();
+
+        const account = findAccountByUsername(username);
+        if (!account) {
+            return res.status(404).json({ error: 'no-account', message: "That username doesn't exist." });
+        }
+
+        const attemptHash = hashPassword(password, account.salt);
+        if (attemptHash !== account.passwordHash) {
+            return res.status(401).json({ error: 'wrong-password', message: 'Incorrect password.' });
+        }
+
+        res.json({ success: true, username: account.username, birthday: account.birthday, gender: account.gender });
+    } catch (err) {
+        console.error('Login error:', err);
+        res.status(500).json({ error: 'login-failed', message: 'Something went wrong logging in.' });
+    }
+});
+
+// ---- Check if a username is already taken (used for live validation) ----
+app.get('/accounts/exists', (req, res) => {
+    const username = (req.query.username || '').toString();
+    res.json({ exists: !!findAccountByUsername(username) });
 });
 
 // ================= MULTIPLAYER (unchanged) =================
