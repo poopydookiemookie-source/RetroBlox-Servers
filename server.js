@@ -13,17 +13,32 @@ app.use(express.json({ limit: '15mb' }));
 
 // ================= GAME STORAGE SETUP =================
 // Games are persisted to disk so they survive server restarts.
-const DATA_DIR = path.join(__dirname, 'data');
+//
+// IMPORTANT (Render users): Render's free/basic web services use an EPHEMERAL filesystem —
+// anything written to disk is wiped every time the service restarts or redeploys (including
+// just waking back up after the free tier puts it to sleep). If your uploaded games keep
+// disappearing, that's almost always why.
+//
+// Fix: add a Render "Disk" to this service (Dashboard -> your service -> Disks -> Add Disk),
+// mount it at something like /var/data, and set an environment variable DATA_DIR=/var/data
+// on the service. That gives you a real persistent volume. Without a mounted disk, data will
+// NOT survive restarts no matter what this code does.
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const GAMES_INDEX_FILE = path.join(DATA_DIR, 'games.json');
 
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+
+console.log(`[storage] Using DATA_DIR: ${DATA_DIR}`);
 
 let games = [];
 try {
     games = JSON.parse(fs.readFileSync(GAMES_INDEX_FILE, 'utf8'));
+    console.log(`[storage] Loaded ${games.length} game(s) from ${GAMES_INDEX_FILE}`);
 } catch (e) {
     games = [];
+    console.log(`[storage] No existing games.json found at ${GAMES_INDEX_FILE} (starting empty). Reason: ${e.code || e.message}`);
 }
 
 function saveGamesIndex() {
@@ -40,8 +55,10 @@ const ACCOUNTS_INDEX_FILE = path.join(DATA_DIR, 'accounts.json');
 let accounts = [];
 try {
     accounts = JSON.parse(fs.readFileSync(ACCOUNTS_INDEX_FILE, 'utf8'));
+    console.log(`[storage] Loaded ${accounts.length} account(s) from ${ACCOUNTS_INDEX_FILE}`);
 } catch (e) {
     accounts = [];
+    console.log(`[storage] No existing accounts.json found at ${ACCOUNTS_INDEX_FILE} (starting empty). Reason: ${e.code || e.message}`);
 }
 
 function saveAccountsIndex() {
@@ -82,6 +99,19 @@ const upload = multer({
 
 // Home / status route
 app.get('/', (req, res) => res.send('Retroblox Server is Online'));
+
+// ---- Diagnostics: check where data is being stored and how much is loaded ----
+// Visit this in a browser to sanity-check persistence, e.g. after a redeploy.
+app.get('/debug/storage', (req, res) => {
+    res.json({
+        dataDir: DATA_DIR,
+        usingEnvOverride: !!process.env.DATA_DIR,
+        gamesLoaded: games.length,
+        accountsLoaded: accounts.length,
+        uploadsDirExists: fs.existsSync(UPLOADS_DIR),
+        note: "If gamesLoaded/accountsLoaded reset to 0 after every restart, this service's filesystem is ephemeral — mount a persistent Disk and set DATA_DIR to its path."
+    });
+});
 
 // ---- List all games (used by the home page) ----
 app.get('/games', (req, res) => {
