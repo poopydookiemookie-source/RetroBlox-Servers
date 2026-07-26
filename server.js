@@ -318,7 +318,9 @@ const io = new Server(server, {
     cors: {
         origin: "*", // This allows your local computer to connect
         methods: ["GET", "POST"]
-    }
+    },
+    pingInterval: 10000,
+    pingTimeout: 8000 // detect a lost/crashed tab within ~18s instead of the ~60s default
 });
 
 const gameStates = {};
@@ -351,16 +353,48 @@ io.on('connection', (socket) => {
         }
     });
 
+    // ---- Appearance changed mid-session (e.g. player swaps a hat/shirt while playing) ----
+    socket.on('updateAppearance', (appearance) => {
+        const rooms = Array.from(socket.rooms);
+        const room = rooms[1];
+        if (room && gameStates[room] && gameStates[room][socket.id]) {
+            gameStates[room][socket.id].appearance = appearance;
+            socket.to(room).emit('peerAppearance', { id: socket.id, appearance });
+        }
+    });
+
+    // ---- Chat: relay a message to everyone else in the same game room ----
+    socket.on('chatMessage', (message) => {
+        const rooms = Array.from(socket.rooms);
+        const room = rooms[1];
+        if (!room) return;
+        const text = (message || '').toString().slice(0, 200);
+        if (!text) return;
+        // Broadcast to everyone else in the room (sender already renders its own message locally)
+        socket.to(room).emit('chatMessage', { id: socket.id, message: text });
+    });
+
+    // ---- Explicit "I'm leaving" signal so the leaderboard updates immediately instead of ----
+    // ---- waiting for the socket's ping-timeout to notice the tab navigated away.       ----
+    socket.on('leaveGame', () => {
+        leaveAllGameRooms(socket);
+    });
+
     socket.on('disconnecting', () => {
+        leaveAllGameRooms(socket);
+    });
+
+    socket.on('disconnect', updateGlobalCounts);
+
+    function leaveAllGameRooms(socket) {
         socket.rooms.forEach(room => {
             if (gameStates[room] && gameStates[room][socket.id]) {
                 delete gameStates[room][socket.id];
                 socket.to(room).emit('playerLeft', socket.id);
             }
         });
-    });
-
-    socket.on('disconnect', updateGlobalCounts);
+        updateGlobalCounts();
+    }
 });
 
 function updateGlobalCounts() {
