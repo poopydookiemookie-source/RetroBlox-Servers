@@ -61,6 +61,15 @@ try {
     console.log(`[storage] No existing accounts.json found at ${ACCOUNTS_INDEX_FILE} (starting empty). Reason: ${e.code || e.message}`);
 }
 
+// Backfill fields for accounts created before friends/favorites/last-played/likes existed
+accounts.forEach(a => {
+    if (!Array.isArray(a.friends)) a.friends = [];
+    if (!Array.isArray(a.favorites)) a.favorites = [];
+    if (!Array.isArray(a.lastPlayed)) a.lastPlayed = [];
+    if (!Array.isArray(a.likedGames)) a.likedGames = [];
+    if (!Array.isArray(a.dislikedGames)) a.dislikedGames = [];
+});
+
 function saveAccountsIndex() {
     try {
         fs.writeFileSync(ACCOUNTS_INDEX_FILE, JSON.stringify(accounts, null, 2));
@@ -171,30 +180,51 @@ app.post('/upload', upload.single('file'), (req, res) => {
     }
 });
 
+// A logged-in user's vote identity is their username (stable across devices/browsers).
+// A logged-out user falls back to whatever anonymous userId the client generated.
+function voteIdentity(req, source) {
+    const username = (source.username || '').toString().trim();
+    const userId = (source.userId || '').toString();
+    return { identity: username || userId, username };
+}
+
 // ---- Like a game (one vote per user) ----
 app.post('/games/:id/like', (req, res) => {
     const g = games.find(x => x.id === req.params.id);
     if (!g) return res.status(404).json({ error: 'Game not found' });
-    const userId = (req.body.userId || '').toString();
-    if (!userId) return res.status(400).json({ error: 'Missing userId' });
+    const { identity, username } = voteIdentity(req, req.body);
+    if (!identity) return res.status(400).json({ error: 'Missing userId' });
 
     if (!Array.isArray(g.likedBy)) g.likedBy = [];
     if (!Array.isArray(g.dislikedBy)) g.dislikedBy = [];
 
-    if (g.likedBy.includes(userId)) {
+    if (g.likedBy.includes(identity)) {
         return res.json({ likes: g.likes, dislikes: g.dislikes, vote: 'like', status: 'already-voted' });
     }
 
-    g.likedBy.push(userId);
+    g.likedBy.push(identity);
     g.likes++;
 
-    const dIdx = g.dislikedBy.indexOf(userId);
+    const dIdx = g.dislikedBy.indexOf(identity);
     if (dIdx !== -1) {
         g.dislikedBy.splice(dIdx, 1);
         g.dislikes = Math.max(0, g.dislikes - 1);
     }
 
     saveGamesIndex();
+
+    // Store the like on the account too, so it's persisted server-side (not just localStorage)
+    if (username) {
+        const account = findAccountByUsername(username);
+        if (account) {
+            if (!Array.isArray(account.likedGames)) account.likedGames = [];
+            if (!Array.isArray(account.dislikedGames)) account.dislikedGames = [];
+            if (!account.likedGames.includes(g.id)) account.likedGames.push(g.id);
+            account.dislikedGames = account.dislikedGames.filter(id => id !== g.id);
+            saveAccountsIndex();
+        }
+    }
+
     res.json({ likes: g.likes, dislikes: g.dislikes, vote: 'like', status: 'ok' });
 });
 
@@ -202,26 +232,38 @@ app.post('/games/:id/like', (req, res) => {
 app.post('/games/:id/dislike', (req, res) => {
     const g = games.find(x => x.id === req.params.id);
     if (!g) return res.status(404).json({ error: 'Game not found' });
-    const userId = (req.body.userId || '').toString();
-    if (!userId) return res.status(400).json({ error: 'Missing userId' });
+    const { identity, username } = voteIdentity(req, req.body);
+    if (!identity) return res.status(400).json({ error: 'Missing userId' });
 
     if (!Array.isArray(g.likedBy)) g.likedBy = [];
     if (!Array.isArray(g.dislikedBy)) g.dislikedBy = [];
 
-    if (g.dislikedBy.includes(userId)) {
+    if (g.dislikedBy.includes(identity)) {
         return res.json({ likes: g.likes, dislikes: g.dislikes, vote: 'dislike', status: 'already-voted' });
     }
 
-    g.dislikedBy.push(userId);
+    g.dislikedBy.push(identity);
     g.dislikes++;
 
-    const lIdx = g.likedBy.indexOf(userId);
+    const lIdx = g.likedBy.indexOf(identity);
     if (lIdx !== -1) {
         g.likedBy.splice(lIdx, 1);
         g.likes = Math.max(0, g.likes - 1);
     }
 
     saveGamesIndex();
+
+    if (username) {
+        const account = findAccountByUsername(username);
+        if (account) {
+            if (!Array.isArray(account.likedGames)) account.likedGames = [];
+            if (!Array.isArray(account.dislikedGames)) account.dislikedGames = [];
+            if (!account.dislikedGames.includes(g.id)) account.dislikedGames.push(g.id);
+            account.likedGames = account.likedGames.filter(id => id !== g.id);
+            saveAccountsIndex();
+        }
+    }
+
     res.json({ likes: g.likes, dislikes: g.dislikes, vote: 'dislike', status: 'ok' });
 });
 
@@ -229,11 +271,11 @@ app.post('/games/:id/dislike', (req, res) => {
 app.get('/games/:id/vote-status', (req, res) => {
     const g = games.find(x => x.id === req.params.id);
     if (!g) return res.status(404).json({ error: 'Game not found' });
-    const userId = (req.query.userId || '').toString();
+    const { identity } = voteIdentity(req, req.query);
 
     let vote = null;
-    if (Array.isArray(g.likedBy) && g.likedBy.includes(userId)) vote = 'like';
-    else if (Array.isArray(g.dislikedBy) && g.dislikedBy.includes(userId)) vote = 'dislike';
+    if (Array.isArray(g.likedBy) && g.likedBy.includes(identity)) vote = 'like';
+    else if (Array.isArray(g.dislikedBy) && g.dislikedBy.includes(identity)) vote = 'dislike';
 
     res.json({ vote, likes: g.likes, dislikes: g.dislikes });
 });
@@ -270,7 +312,12 @@ app.post('/accounts/signup', (req, res) => {
             passwordHash,
             birthday,
             gender,
-            createdAt: Date.now()
+            createdAt: Date.now(),
+            friends: [],
+            favorites: [],
+            lastPlayed: [],
+            likedGames: [],
+            dislikedGames: []
         };
 
         accounts.push(account);
@@ -310,6 +357,142 @@ app.post('/accounts/login', (req, res) => {
 app.get('/accounts/exists', (req, res) => {
     const username = (req.query.username || '').toString();
     res.json({ exists: !!findAccountByUsername(username) });
+});
+
+// ================= FRIENDS =================
+
+// ---- Add a friend (mutual - adds both ways) ----
+app.post('/accounts/:username/friends', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    const friendUsername = (req.body.friendUsername || '').toString().trim();
+    if (!friendUsername) return res.status(400).json({ error: 'missing-friend', message: 'Missing friendUsername.' });
+    if (friendUsername.toLowerCase() === account.username.toLowerCase()) {
+        return res.status(400).json({ error: 'cannot-friend-self', message: "You can't add yourself as a friend." });
+    }
+
+    const friendAccount = findAccountByUsername(friendUsername);
+    if (!friendAccount) return res.status(404).json({ error: 'friend-not-found', message: 'That user does not exist.' });
+
+    if (!Array.isArray(account.friends)) account.friends = [];
+    if (!Array.isArray(friendAccount.friends)) friendAccount.friends = [];
+
+    if (!account.friends.some(f => f.toLowerCase() === friendAccount.username.toLowerCase())) {
+        account.friends.push(friendAccount.username);
+    }
+    if (!friendAccount.friends.some(f => f.toLowerCase() === account.username.toLowerCase())) {
+        friendAccount.friends.push(account.username);
+    }
+
+    saveAccountsIndex();
+    res.json({ success: true, friends: account.friends });
+});
+
+// ---- Remove a friend (mutual - removes both ways) ----
+app.post('/accounts/:username/friends/remove', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    const friendUsername = (req.body.friendUsername || '').toString().trim();
+    if (!Array.isArray(account.friends)) account.friends = [];
+    account.friends = account.friends.filter(f => f.toLowerCase() !== friendUsername.toLowerCase());
+
+    const friendAccount = findAccountByUsername(friendUsername);
+    if (friendAccount && Array.isArray(friendAccount.friends)) {
+        friendAccount.friends = friendAccount.friends.filter(f => f.toLowerCase() !== account.username.toLowerCase());
+    }
+
+    saveAccountsIndex();
+    res.json({ success: true, friends: account.friends });
+});
+
+// ---- List a user's friends ----
+app.get('/accounts/:username/friends', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+    if (!Array.isArray(account.friends)) account.friends = [];
+    res.json(account.friends);
+});
+
+// ================= FAVORITES =================
+
+// ---- Toggle a game as favorited (adds if not present, removes if present) ----
+app.post('/accounts/:username/favorites', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    const gameId = (req.body.gameId || '').toString();
+    if (!gameId) return res.status(400).json({ error: 'missing-gameId', message: 'Missing gameId.' });
+
+    if (!Array.isArray(account.favorites)) account.favorites = [];
+    const idx = account.favorites.indexOf(gameId);
+    if (idx !== -1) account.favorites.splice(idx, 1);
+    else account.favorites.unshift(gameId);
+
+    saveAccountsIndex();
+
+    const favGames = account.favorites.map(id => games.find(g => g.id === id)).filter(Boolean).map(publicGame);
+    res.json({ success: true, favorited: idx === -1, favorites: favGames });
+});
+
+// ---- List a user's favorited games (full game objects) ----
+app.get('/accounts/:username/favorites', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+    if (!Array.isArray(account.favorites)) account.favorites = [];
+
+    const favGames = account.favorites.map(id => games.find(g => g.id === id)).filter(Boolean).map(publicGame);
+    res.json(favGames);
+});
+
+// ================= LAST PLAYED =================
+
+const MAX_LAST_PLAYED = 10;
+
+// ---- Record that a user just played a game (call this when they open a game) ----
+app.post('/accounts/:username/last-played', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    const gameId = (req.body.gameId || '').toString();
+    if (!gameId) return res.status(400).json({ error: 'missing-gameId', message: 'Missing gameId.' });
+
+    if (!Array.isArray(account.lastPlayed)) account.lastPlayed = [];
+    account.lastPlayed = account.lastPlayed.filter(e => e.gameId !== gameId);
+    account.lastPlayed.unshift({ gameId, playedAt: Date.now() });
+    account.lastPlayed = account.lastPlayed.slice(0, MAX_LAST_PLAYED);
+
+    saveAccountsIndex();
+    res.json({ success: true });
+});
+
+// ---- List a user's recently played games, most recent first (full game objects) ----
+app.get('/accounts/:username/last-played', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+    if (!Array.isArray(account.lastPlayed)) account.lastPlayed = [];
+
+    const entries = account.lastPlayed
+        .map(e => {
+            const g = games.find(x => x.id === e.gameId);
+            return g ? { game: publicGame(g), playedAt: e.playedAt } : null;
+        })
+        .filter(Boolean);
+
+    res.json(entries);
+});
+
+// ================= LIKED GAMES (mirrors the vote stored on the game itself) =================
+
+// ---- List the games a user has liked ----
+app.get('/accounts/:username/liked-games', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+    if (!Array.isArray(account.likedGames)) account.likedGames = [];
+
+    const likedGames = account.likedGames.map(id => games.find(g => g.id === id)).filter(Boolean).map(publicGame);
+    res.json(likedGames);
 });
 
 // ================= MULTIPLAYER (unchanged) =================
