@@ -69,11 +69,14 @@ accounts.forEach(a => {
     if (!Array.isArray(a.likedGames)) a.likedGames = [];
     if (!Array.isArray(a.dislikedGames)) a.dislikedGames = [];
     if (!Array.isArray(a.friendRequests)) a.friendRequests = [];
+    if (!Array.isArray(a.inventory)) a.inventory = [];
     if (typeof a.avatarImage !== 'string') a.avatarImage = null;
     if (typeof a.robux !== 'number' || isNaN(a.robux)) a.robux = 0;
     if (typeof a.tix !== 'number' || isNaN(a.tix)) a.tix = 0;
     if (typeof a.banned !== 'boolean') a.banned = false;
     if (typeof a.banReason !== 'string') a.banReason = '';
+    if (typeof a.banExpiresAt !== 'number') a.banExpiresAt = null;
+    if (typeof a.lastDailyRewardAt !== 'number') a.lastDailyRewardAt = 0;
 });
 
 function saveAccountsIndex() {
@@ -87,6 +90,81 @@ function saveAccountsIndex() {
 function findAccountByUsername(username) {
     const lower = (username || '').toString().toLowerCase();
     return accounts.find(a => a.username.toLowerCase() === lower);
+}
+
+// ================= PLAYER IDs =================
+// Every account gets a permanent, sequential player number - the first account ever
+// created on this server is #1, the next is #2, and so on. IDs are never reused (even
+// if an account is later terminated), so this counter is persisted separately from the
+// accounts list itself.
+const PLAYER_ID_COUNTER_FILE = path.join(DATA_DIR, 'player_id_counter.json');
+let nextPlayerId = 1;
+let counterFileExisted = false;
+try {
+    const counterData = JSON.parse(fs.readFileSync(PLAYER_ID_COUNTER_FILE, 'utf8'));
+    if (typeof counterData.next === 'number' && counterData.next > 0) {
+        nextPlayerId = counterData.next;
+        counterFileExisted = true;
+    }
+} catch (e) {
+    // No counter file yet - fine, we'll create one below.
+}
+
+function savePlayerIdCounter() {
+    try {
+        fs.writeFileSync(PLAYER_ID_COUNTER_FILE, JSON.stringify({ next: nextPlayerId }));
+    } catch (e) {
+        console.error('Failed to save player ID counter:', e);
+    }
+}
+
+// Backfill playerId for accounts that existed before this feature - assigned in the
+// same order they're stored in (i.e. signup order), so the very first account to ever
+// sign up becomes player #1.
+let backfilledAnyPlayerId = false;
+accounts.forEach(a => {
+    if (typeof a.playerId !== 'number') {
+        a.playerId = nextPlayerId++;
+        backfilledAnyPlayerId = true;
+    }
+});
+if (backfilledAnyPlayerId || !counterFileExisted) savePlayerIdCounter();
+if (backfilledAnyPlayerId) saveAccountsIndex();
+
+// ================= BANS =================
+// If a ban has an expiry and it's passed, lift it automatically. Called lazily
+// whenever an account is touched, AND swept periodically (see setInterval near the
+// bottom of this file) so bans lift on their own even with no incoming requests.
+function liftBanIfExpired(account) {
+    if (account.banned && account.banExpiresAt && Date.now() >= account.banExpiresAt) {
+        account.banned = false;
+        account.banReason = '';
+        account.banExpiresAt = null;
+        return true;
+    }
+    return false;
+}
+
+// ================= DAILY TIX BONUS =================
+// Everyone starts with 10 Tix (see signup below) and gets another 10 Tix the first
+// time they're active on a new calendar day (UTC).
+const DAILY_TIX_AMOUNT = 10;
+function isNewCalendarDay(prevTimestamp, nowTimestamp) {
+    if (!prevTimestamp) return true;
+    const prev = new Date(prevTimestamp);
+    const now = new Date(nowTimestamp);
+    return prev.getUTCFullYear() !== now.getUTCFullYear() ||
+           prev.getUTCMonth() !== now.getUTCMonth() ||
+           prev.getUTCDate() !== now.getUTCDate();
+}
+function grantDailyTixIfDue(account) {
+    const now = Date.now();
+    if (isNewCalendarDay(account.lastDailyRewardAt, now)) {
+        account.tix = (account.tix || 0) + DAILY_TIX_AMOUNT;
+        account.lastDailyRewardAt = now;
+        return DAILY_TIX_AMOUNT;
+    }
+    return null;
 }
 
 // ================= ADMIN CONFIG =================
@@ -137,14 +215,45 @@ function publicGame(g) {
 function publicAccount(a) {
     return {
         username: a.username,
+        playerId: a.playerId,
         avatarImage: a.avatarImage || null,
         createdAt: a.createdAt,
         robux: a.robux || 0,
         tix: a.tix || 0,
         banned: !!a.banned,
         banReason: a.banReason || '',
+        banExpiresAt: a.banExpiresAt || null,
         friendsCount: Array.isArray(a.friends) ? a.friends.length : 0
     };
+}
+
+// Minimal public view used for player search results - no currency/ban details, just
+// enough to find someone and see how "popular" (friended) they are.
+function publicSearchAccount(a) {
+    return {
+        username: a.username,
+        playerId: a.playerId,
+        avatarImage: a.avatarImage || null,
+        friendsCount: Array.isArray(a.friends) ? a.friends.length : 0
+    };
+}
+
+// ================= CATALOG =================
+// Server-side source of truth for buyable avatar items and their prices, so a client
+// can never just send whatever price it wants to the /inventory/buy route. Every face
+// in the Avatar Editor is uploaded by RETROBLOX and costs 10 Tix.
+const CATALOG_FACE_FILES = ["crying.png", "dizzy.png", "funny.png", "goofy.png", "john.png", "manface.png", "scared.png", "superhappy.png", "tongue.png", "winningsmile.png", "woman.png"];
+const FACE_PRICE_TIX = 10;
+const CATALOG_ITEMS = CATALOG_FACE_FILES.map(file => ({
+    itemPath: `./items/faces/${file}`,
+    name: file.split('.')[0].replace(/_/g, ' '),
+    category: 'faces',
+    price: FACE_PRICE_TIX,
+    currency: 'tix',
+    creator: 'RETROBLOX'
+}));
+function findCatalogItem(itemPath) {
+    return CATALOG_ITEMS.find(i => i.itemPath === itemPath);
 }
 
 const upload = multer({
@@ -360,37 +469,45 @@ app.post('/accounts/signup', (req, res) => {
         const salt = crypto.randomBytes(16).toString('hex');
         const passwordHash = hashPassword(password, salt);
 
+        const now = Date.now();
         const account = {
             username,
+            playerId: nextPlayerId++,
             salt,
             passwordHash,
             birthday,
             gender,
-            createdAt: Date.now(),
+            createdAt: now,
             friends: [],
             friendRequests: [],
             favorites: [],
             lastPlayed: [],
             likedGames: [],
             dislikedGames: [],
+            inventory: [],
             avatarImage: null,
             robux: 0,
-            tix: 500, // small welcome bonus of classic-style Tix
+            tix: 10, // everyone starts with 10 Tix, plus 10 more every new calendar day they're active
+            lastDailyRewardAt: now,
             banned: false,
-            banReason: ''
+            banReason: '',
+            banExpiresAt: null
         };
 
         accounts.push(account);
         saveAccountsIndex();
+        savePlayerIdCounter();
 
         res.json({
             success: true,
             username: account.username,
+            playerId: account.playerId,
             birthday: account.birthday,
             gender: account.gender,
             avatarImage: account.avatarImage,
             robux: account.robux,
             tix: account.tix,
+            inventory: account.inventory,
             isAdmin: isAdminUsername(account.username)
         });
     } catch (err) {
@@ -415,7 +532,10 @@ app.post('/accounts/login', (req, res) => {
             return res.status(401).json({ error: 'wrong-password', message: 'Incorrect password.' });
         }
 
+        let dirty = liftBanIfExpired(account);
+
         if (account.banned) {
+            if (dirty) saveAccountsIndex();
             return res.status(403).json({
                 error: 'banned',
                 message: account.banReason
@@ -424,15 +544,22 @@ app.post('/accounts/login', (req, res) => {
             });
         }
 
+        const dailyBonusGranted = grantDailyTixIfDue(account);
+        if (dailyBonusGranted) dirty = true;
+        if (dirty) saveAccountsIndex();
+
         res.json({
             success: true,
             username: account.username,
+            playerId: account.playerId,
             birthday: account.birthday,
             gender: account.gender,
             avatarImage: account.avatarImage || null,
             robux: account.robux || 0,
             tix: account.tix || 0,
-            isAdmin: isAdminUsername(account.username)
+            inventory: account.inventory || [],
+            isAdmin: isAdminUsername(account.username),
+            dailyBonusGranted
         });
     } catch (err) {
         console.error('Login error:', err);
@@ -452,16 +579,30 @@ app.get('/accounts/exists', (req, res) => {
 app.get('/accounts/:username', (req, res) => {
     const account = findAccountByUsername(req.params.username);
     if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    let dirty = liftBanIfExpired(account);
+    // Only hand out the daily bonus to an account that isn't (currently) banned.
+    let dailyBonusGranted = null;
+    if (!account.banned) {
+        dailyBonusGranted = grantDailyTixIfDue(account);
+        if (dailyBonusGranted) dirty = true;
+    }
+    if (dirty) saveAccountsIndex();
+
     res.json({
         username: account.username,
+        playerId: account.playerId,
         birthday: account.birthday,
         gender: account.gender,
         avatarImage: account.avatarImage || null,
         robux: account.robux || 0,
         tix: account.tix || 0,
+        inventory: account.inventory || [],
         isAdmin: isAdminUsername(account.username),
         banned: !!account.banned,
-        banReason: account.banReason || ''
+        banReason: account.banReason || '',
+        banExpiresAt: account.banExpiresAt || null,
+        dailyBonusGranted
     });
 });
 
@@ -482,6 +623,76 @@ app.post('/accounts/:username/avatar', (req, res) => {
     account.avatarImage = avatarImage;
     saveAccountsIndex();
     res.json({ success: true });
+});
+
+// ---- List every buyable catalog item (currently: faces, 10 Tix each, all by RETROBLOX) ----
+app.get('/catalog', (req, res) => {
+    res.json(CATALOG_ITEMS);
+});
+
+// ================= INVENTORY =================
+
+// ---- Get a player's owned catalog items ----
+app.get('/accounts/:username/inventory', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+    if (!Array.isArray(account.inventory)) account.inventory = [];
+    res.json({ inventory: account.inventory });
+});
+
+// ---- Buy a catalog item with Tix (currently only faces are sold) ----
+app.post('/accounts/:username/inventory/buy', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+    if (liftBanIfExpired(account)) saveAccountsIndex();
+    if (account.banned) return res.status(403).json({ error: 'banned', message: 'Banned accounts cannot make purchases.' });
+
+    const itemPath = (req.body.itemPath || '').toString();
+    const item = findCatalogItem(itemPath);
+    if (!item) return res.status(400).json({ error: 'invalid-item', message: 'That item is not in the catalog.' });
+
+    if (!Array.isArray(account.inventory)) account.inventory = [];
+    if (account.inventory.includes(itemPath)) {
+        return res.json({ success: true, status: 'already-owned', tix: account.tix, robux: account.robux, inventory: account.inventory });
+    }
+
+    if ((account.tix || 0) < item.price) {
+        return res.status(400).json({ error: 'insufficient-tix', message: `You need ${item.price} Tix to buy this item.` });
+    }
+
+    account.tix -= item.price;
+    account.inventory.push(itemPath);
+    saveAccountsIndex();
+    res.json({ success: true, status: 'purchased', tix: account.tix, robux: account.robux, inventory: account.inventory });
+});
+
+// ================= SEARCH =================
+const SEARCH_RESULT_LIMIT = 24;
+
+// ---- Search (or browse) players. Empty q -> most "popular" (most friends) first. ----
+app.get('/search/players', (req, res) => {
+    const q = (req.query.q || '').toString().trim().toLowerCase();
+    let results = accounts.slice();
+    if (q) {
+        results = results.filter(a => a.username.toLowerCase().includes(q));
+    }
+    results.sort((a, b) => {
+        const byFriends = (Array.isArray(b.friends) ? b.friends.length : 0) - (Array.isArray(a.friends) ? a.friends.length : 0);
+        if (byFriends !== 0) return byFriends;
+        return (a.playerId || 0) - (b.playerId || 0);
+    });
+    res.json(results.slice(0, SEARCH_RESULT_LIMIT).map(publicSearchAccount));
+});
+
+// ---- Search (or browse) games. Empty q -> most "popular" (most likes) first. ----
+app.get('/search/games', (req, res) => {
+    const q = (req.query.q || '').toString().trim().toLowerCase();
+    let results = games.filter(g => !g.takenDown);
+    if (q) {
+        results = results.filter(g => g.name.toLowerCase().includes(q));
+    }
+    results.sort((a, b) => (b.likes || 0) - (a.likes || 0));
+    res.json(results.slice(0, SEARCH_RESULT_LIMIT).map(publicGame));
 });
 
 // ================= FRIENDS =================
@@ -740,10 +951,14 @@ app.post('/admin/games/:id/restore', (req, res) => {
 // ---- List every player account for the admin players panel ----
 app.get('/admin/players', (req, res) => {
     if (!requireAdmin(req, res)) return;
+    let changed = false;
+    accounts.forEach(a => { if (liftBanIfExpired(a)) changed = true; });
+    if (changed) saveAccountsIndex();
     res.json(accounts.map(publicAccount));
 });
 
-// ---- Ban a player (blocks login and multiplayer join) ----
+// ---- Ban a player (blocks login and multiplayer join). Optional durationMs auto-unbans ----
+// ---- them once that much time has passed (see liftBanIfExpired + the sweep below). ----
 app.post('/admin/players/:username/ban', (req, res) => {
     if (!requireAdmin(req, res)) return;
     const account = findAccountByUsername(req.params.username);
@@ -752,8 +967,10 @@ app.post('/admin/players/:username/ban', (req, res) => {
         return res.status(400).json({ error: 'cannot-ban-admin', message: 'Admins cannot be banned.' });
     }
 
+    const durationMs = Number(req.body.durationMs);
     account.banned = true;
     account.banReason = (req.body.reason || '').toString().slice(0, 300);
+    account.banExpiresAt = (durationMs && durationMs > 0) ? Date.now() + durationMs : null;
     saveAccountsIndex();
     res.json({ success: true, account: publicAccount(account) });
 });
@@ -766,8 +983,31 @@ app.post('/admin/players/:username/unban', (req, res) => {
 
     account.banned = false;
     account.banReason = '';
+    account.banExpiresAt = null;
     saveAccountsIndex();
     res.json({ success: true, account: publicAccount(account) });
+});
+
+// ---- Terminate (permanently delete) a player's account. Cannot be undone. ----
+app.post('/admin/players/:username/terminate', (req, res) => {
+    if (!requireAdmin(req, res)) return;
+    const idx = accounts.findIndex(a => a.username.toLowerCase() === req.params.username.toLowerCase());
+    if (idx === -1) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+    if (isAdminUsername(accounts[idx].username)) {
+        return res.status(400).json({ error: 'cannot-terminate-admin', message: 'Admins cannot be terminated.' });
+    }
+
+    const removedUsername = accounts[idx].username;
+    accounts.splice(idx, 1);
+
+    // Clean up any references to the removed account left on other accounts.
+    accounts.forEach(a => {
+        if (Array.isArray(a.friends)) a.friends = a.friends.filter(f => f.toLowerCase() !== removedUsername.toLowerCase());
+        if (Array.isArray(a.friendRequests)) a.friendRequests = a.friendRequests.filter(f => f.toLowerCase() !== removedUsername.toLowerCase());
+    });
+
+    saveAccountsIndex();
+    res.json({ success: true });
 });
 
 // ---- Grant (or deduct, with a negative amount) Robux/Tix to a player ----
@@ -800,6 +1040,7 @@ const gameStates = {};
 io.on('connection', (socket) => {
     socket.on('joinGame', ({ gameId, userData }) => {
         const account = findAccountByUsername((userData && userData.username) || '');
+        if (account && liftBanIfExpired(account)) saveAccountsIndex();
         if (account && account.banned) {
             socket.emit('banned', { reason: account.banReason || 'You have been banned.' });
             return;
@@ -882,6 +1123,16 @@ function updateGlobalCounts() {
     }
     io.emit('playerCounts', counts);
 }
+
+// Ban-timer sweep: every minute, check every banned account with an expiry and lift
+// the ban if it's passed - this is what makes bans "automatically" expire even if
+// nobody happens to log in, load the admin panel, or try to join a game in the
+// meantime.
+setInterval(() => {
+    let changed = false;
+    accounts.forEach(a => { if (liftBanIfExpired(a)) changed = true; });
+    if (changed) saveAccountsIndex();
+}, 60 * 1000);
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
