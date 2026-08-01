@@ -70,6 +70,10 @@ accounts.forEach(a => {
     if (!Array.isArray(a.dislikedGames)) a.dislikedGames = [];
     if (!Array.isArray(a.friendRequests)) a.friendRequests = [];
     if (!Array.isArray(a.inventory)) a.inventory = [];
+    if (!Array.isArray(a.followers)) a.followers = [];
+    if (!Array.isArray(a.following)) a.following = [];
+    if (!Array.isArray(a.blockedUsers)) a.blockedUsers = [];
+    if (typeof a.bio !== 'string') a.bio = '';
     if (typeof a.avatarImage !== 'string') a.avatarImage = null;
     if (typeof a.robux !== 'number' || isNaN(a.robux)) a.robux = 0;
     if (typeof a.tix !== 'number' || isNaN(a.tix)) a.tix = 0;
@@ -254,6 +258,24 @@ const CATALOG_ITEMS = CATALOG_FACE_FILES.map(file => ({
 }));
 function findCatalogItem(itemPath) {
     return CATALOG_ITEMS.find(i => i.itemPath === itemPath);
+}
+
+// ================= REPORTS =================
+// Minimal record-keeping for the "Report" action on player profiles - just persisted
+// to disk for now, there's no admin review UI for these yet.
+const REPORTS_FILE = path.join(DATA_DIR, 'reports.json');
+let reports = [];
+try {
+    reports = JSON.parse(fs.readFileSync(REPORTS_FILE, 'utf8'));
+} catch (e) {
+    reports = [];
+}
+function saveReports() {
+    try {
+        fs.writeFileSync(REPORTS_FILE, JSON.stringify(reports, null, 2));
+    } catch (e) {
+        console.error('Failed to save reports:', e);
+    }
 }
 
 const upload = multer({
@@ -693,6 +715,169 @@ app.get('/search/games', (req, res) => {
     }
     results.sort((a, b) => (b.likes || 0) - (a.likes || 0));
     res.json(results.slice(0, SEARCH_RESULT_LIMIT).map(publicGame));
+});
+
+// ================= PUBLIC PROFILE =================
+
+// ---- Get everything a player-profile page needs about an account, plus (if a ----
+// ---- ?viewer=username is passed) how the viewer relates to them (friend/follow/block). ----
+app.get('/accounts/:username/profile', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    if (!Array.isArray(account.friends)) account.friends = [];
+    if (!Array.isArray(account.followers)) account.followers = [];
+    if (!Array.isArray(account.following)) account.following = [];
+    if (typeof account.bio !== 'string') account.bio = '';
+
+    const viewerUsername = (req.query.viewer || '').toString().trim();
+    const viewer = viewerUsername ? findAccountByUsername(viewerUsername) : null;
+
+    let relationship = null;
+    if (viewer && viewer.username.toLowerCase() !== account.username.toLowerCase()) {
+        if (!Array.isArray(viewer.following)) viewer.following = [];
+        if (!Array.isArray(viewer.blockedUsers)) viewer.blockedUsers = [];
+        relationship = {
+            isFriend: account.friends.some(f => f.toLowerCase() === viewer.username.toLowerCase()),
+            isFollowing: viewer.following.some(u => u.toLowerCase() === account.username.toLowerCase()),
+            isFollowedBy: account.following.some(u => u.toLowerCase() === viewer.username.toLowerCase()),
+            isBlocked: viewer.blockedUsers.some(u => u.toLowerCase() === account.username.toLowerCase())
+        };
+    }
+
+    res.json({
+        username: account.username,
+        playerId: account.playerId,
+        avatarImage: account.avatarImage || null,
+        createdAt: account.createdAt,
+        bio: account.bio || '',
+        friendsCount: account.friends.length,
+        followersCount: account.followers.length,
+        followingCount: account.following.length,
+        relationship
+    });
+});
+
+// ---- Update a player's bio (shown on their profile) ----
+app.post('/accounts/:username/bio', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    account.bio = (req.body.bio || '').toString().slice(0, 500);
+    saveAccountsIndex();
+    res.json({ success: true, bio: account.bio });
+});
+
+// ================= FOLLOW (one-directional, separate from mutual Friends) =================
+
+// ---- Follow a player ----
+app.post('/accounts/:username/follow', (req, res) => {
+    const target = findAccountByUsername(req.params.username);
+    if (!target) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    const followerUsername = (req.body.followerUsername || '').toString().trim();
+    const follower = findAccountByUsername(followerUsername);
+    if (!follower) return res.status(404).json({ error: 'no-follower-account', message: 'Your account was not found.' });
+    if (follower.username.toLowerCase() === target.username.toLowerCase()) {
+        return res.status(400).json({ error: 'cannot-follow-self', message: "You can't follow yourself." });
+    }
+
+    if (!Array.isArray(target.followers)) target.followers = [];
+    if (!Array.isArray(follower.following)) follower.following = [];
+
+    if (!target.followers.some(u => u.toLowerCase() === follower.username.toLowerCase())) {
+        target.followers.push(follower.username);
+    }
+    if (!follower.following.some(u => u.toLowerCase() === target.username.toLowerCase())) {
+        follower.following.push(target.username);
+    }
+
+    saveAccountsIndex();
+    res.json({ success: true, followersCount: target.followers.length });
+});
+
+// ---- Unfollow a player ----
+app.post('/accounts/:username/unfollow', (req, res) => {
+    const target = findAccountByUsername(req.params.username);
+    if (!target) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    const followerUsername = (req.body.followerUsername || '').toString().trim();
+    const follower = findAccountByUsername(followerUsername);
+
+    if (!Array.isArray(target.followers)) target.followers = [];
+    target.followers = target.followers.filter(u => u.toLowerCase() !== followerUsername.toLowerCase());
+    if (follower && Array.isArray(follower.following)) {
+        follower.following = follower.following.filter(u => u.toLowerCase() !== target.username.toLowerCase());
+    }
+
+    saveAccountsIndex();
+    res.json({ success: true, followersCount: target.followers.length });
+});
+
+// ================= BLOCK =================
+
+// ---- Block a player - also strips any existing friendship/follow between the two ----
+app.post('/accounts/:username/block', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    const blockedUsername = (req.body.blockedUsername || '').toString().trim();
+    if (!blockedUsername) return res.status(400).json({ error: 'missing-blocked', message: 'Missing blockedUsername.' });
+    if (blockedUsername.toLowerCase() === account.username.toLowerCase()) {
+        return res.status(400).json({ error: 'cannot-block-self', message: "You can't block yourself." });
+    }
+
+    if (!Array.isArray(account.blockedUsers)) account.blockedUsers = [];
+    if (!account.blockedUsers.some(u => u.toLowerCase() === blockedUsername.toLowerCase())) {
+        account.blockedUsers.push(blockedUsername);
+    }
+
+    account.friends = (account.friends || []).filter(f => f.toLowerCase() !== blockedUsername.toLowerCase());
+    account.following = (account.following || []).filter(f => f.toLowerCase() !== blockedUsername.toLowerCase());
+    account.followers = (account.followers || []).filter(f => f.toLowerCase() !== blockedUsername.toLowerCase());
+
+    const blockedAccount = findAccountByUsername(blockedUsername);
+    if (blockedAccount) {
+        blockedAccount.friends = (blockedAccount.friends || []).filter(f => f.toLowerCase() !== account.username.toLowerCase());
+        blockedAccount.following = (blockedAccount.following || []).filter(f => f.toLowerCase() !== account.username.toLowerCase());
+        blockedAccount.followers = (blockedAccount.followers || []).filter(f => f.toLowerCase() !== account.username.toLowerCase());
+    }
+
+    saveAccountsIndex();
+    res.json({ success: true, blockedUsers: account.blockedUsers });
+});
+
+// ---- Unblock a player ----
+app.post('/accounts/:username/unblock', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    const blockedUsername = (req.body.blockedUsername || '').toString().trim();
+    if (!Array.isArray(account.blockedUsers)) account.blockedUsers = [];
+    account.blockedUsers = account.blockedUsers.filter(u => u.toLowerCase() !== blockedUsername.toLowerCase());
+    saveAccountsIndex();
+    res.json({ success: true, blockedUsers: account.blockedUsers });
+});
+
+// ================= REPORT =================
+
+// ---- Report a player. No moderation UI yet - just persisted for the record. ----
+app.post('/accounts/:username/report', (req, res) => {
+    const target = findAccountByUsername(req.params.username);
+    if (!target) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    const reporterUsername = (req.body.reporterUsername || 'Guest').toString().slice(0, 60);
+    const reason = (req.body.reason || '').toString().slice(0, 500);
+
+    reports.push({
+        id: crypto.randomUUID(),
+        targetUsername: target.username,
+        reporterUsername,
+        reason,
+        createdAt: Date.now()
+    });
+    saveReports();
+    res.json({ success: true });
 });
 
 // ================= FRIENDS =================
