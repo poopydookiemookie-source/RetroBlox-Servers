@@ -61,6 +61,23 @@ try {
     console.log(`[storage] No existing accounts.json found at ${ACCOUNTS_INDEX_FILE} (starting empty). Reason: ${e.code || e.message}`);
 }
 
+// ================= APPEARANCE (worn items, shown as "Currently Wearing" on profiles) =================
+// Mirrors the equip categories the Avatar Editor already tracks client-side (see
+// AVATAR_CATALOGS in display.html) so a profile page can show what someone has equipped
+// without needing to load their full 3D avatar.
+const APPEARANCE_SLOTS = ['equippedFace', 'equippedHair', 'equippedAccessory', 'equippedShirt', 'equippedPants', 'equippedTShirt'];
+function blankAppearance() {
+    const a = {};
+    APPEARANCE_SLOTS.forEach(slot => { a[slot] = null; });
+    return a;
+}
+function publicAppearance(account) {
+    const a = (account && account.appearance) || {};
+    const out = {};
+    APPEARANCE_SLOTS.forEach(slot => { out[slot] = typeof a[slot] === 'string' && a[slot] ? a[slot] : null; });
+    return out;
+}
+
 // Backfill fields for accounts created before friends/favorites/last-played/likes existed
 accounts.forEach(a => {
     if (!Array.isArray(a.friends)) a.friends = [];
@@ -81,6 +98,10 @@ accounts.forEach(a => {
     if (typeof a.banReason !== 'string') a.banReason = '';
     if (typeof a.banExpiresAt !== 'number') a.banExpiresAt = null;
     if (typeof a.lastDailyRewardAt !== 'number') a.lastDailyRewardAt = 0;
+    if (!a.appearance || typeof a.appearance !== 'object') a.appearance = {};
+    APPEARANCE_SLOTS.forEach(slot => {
+        if (typeof a.appearance[slot] !== 'string' || !a.appearance[slot]) a.appearance[slot] = null;
+    });
 });
 
 function saveAccountsIndex() {
@@ -258,6 +279,96 @@ const CATALOG_ITEMS = CATALOG_FACE_FILES.map(file => ({
 }));
 function findCatalogItem(itemPath) {
     return CATALOG_ITEMS.find(i => i.itemPath === itemPath);
+}
+
+// ================= STARTER PLACE =================
+// Every new account gets its own default game named "<username>'s Place", the same
+// way a brand-new Roblox account starts with a place already in its inventory.
+//
+// This mirrors exactly what Retroblox Studio itself starts a brand-new project with
+// (see the "Baseplate Application" section + the StarterPlayerScripts/CharacterScripts/
+// Camera/Terrain setup near the top of studio.html) and what its own "Export .crbx" /
+// "Publish" flow serializes (getCrbxData() in studio.html): a single 512x20x512-stud
+// grey Baseplate sitting at y:-10 (top face at y:0), plus the Camera/Terrain/StarterPlayer
+// script-folder entries Studio always creates. There's no explicit SpawnLocation - Studio's
+// own play/test code falls back to spawning at (0, 5, 0) when no spawnpoint block exists,
+// which sits right above this baseplate, so that's left out here too, matching the same
+// "brand new project, nothing touched yet" state a real Studio session starts in.
+function buildStarterPlaceContent(username) {
+    const cameraId = 'Camera_' + crypto.randomUUID();
+    const terrainId = 'Terrain_' + crypto.randomUUID();
+    const starterPlayerScriptsId = 'StarterPlayerScripts_' + crypto.randomUUID();
+    const starterCharacterScriptsId = 'StarterCharacterScripts_' + crypto.randomUUID();
+
+    return JSON.stringify({
+        format: 'ClassicCRBX',
+        settings: {
+            name: `${username}'s Place`,
+            creator: username,
+            description: 'Welcome to my game!',
+            icon: null,
+            usePlayerJs: true
+        },
+        blocks: [
+            {
+                x: 0, y: -10, z: 0,
+                scaleX: 256, scaleY: 10, scaleZ: 256,
+                rotX: 0, rotY: 0, rotZ: 0,
+                color: 0x7F7F7F,
+                isSpawnpoint: false,
+                isSeat: false,
+                shape: 'Block',
+                material: 'Studs',
+                userData: {
+                    id: crypto.randomUUID(),
+                    parent: 'Workspace',
+                    canCollide: true,
+                    anchored: true,
+                    transparency: 0,
+                    reflectance: 0,
+                    shape: 'Block',
+                    material: 'Studs'
+                }
+            }
+        ],
+        non3DItems: [
+            { isFolder: true, name: 'StarterPlayerScripts', uuid: starterPlayerScriptsId, parent: 'StarterPlayer' },
+            { isFolder: true, name: 'StarterCharacterScripts', uuid: starterCharacterScriptsId, parent: 'StarterPlayer' },
+            { isCamera: true, className: 'Camera', name: 'Camera', uuid: cameraId, parent: 'Workspace', CameraType: 'Custom', FieldOfView: 70, CameraSubject: '' },
+            { isTerrain: true, className: 'Terrain', name: 'Terrain', uuid: terrainId, parent: 'Workspace', WaterColor: '#00aaff', WaterTransparency: 1 }
+        ]
+    });
+}
+
+function createStarterPlace(username, now) {
+    try {
+        const id = crypto.randomUUID();
+        const filename = `${id}.crbx`;
+        fs.writeFileSync(path.join(UPLOADS_DIR, filename), buildStarterPlaceContent(username));
+
+        const game = {
+            id,
+            name: `${username}'s Place`,
+            creator: username,
+            description: 'Welcome to my game!',
+            icon: null,
+            filename,
+            likes: 0,
+            dislikes: 0,
+            likedBy: [],
+            dislikedBy: [],
+            createdAt: now,
+            takenDown: false,
+            takedownReason: ''
+        };
+
+        games.unshift(game);
+        saveGamesIndex();
+        return game;
+    } catch (err) {
+        console.error('Failed to create starter place:', err);
+        return null;
+    }
 }
 
 // ================= REPORTS =================
@@ -508,6 +619,7 @@ app.post('/accounts/signup', (req, res) => {
             dislikedGames: [],
             inventory: [],
             avatarImage: null,
+            appearance: blankAppearance(),
             robux: 0,
             tix: 10, // everyone starts with 10 Tix, plus 10 more every new calendar day they're active
             lastDailyRewardAt: now,
@@ -520,6 +632,11 @@ app.post('/accounts/signup', (req, res) => {
         saveAccountsIndex();
         savePlayerIdCounter();
 
+        // Every new account gets a starter game of their own, just like a fresh Roblox
+        // account gets a default "[Username]'s Place". See createStarterPlace() for an
+        // important caveat about the placeholder content it's saved with.
+        const starterGame = createStarterPlace(account.username, now);
+
         res.json({
             success: true,
             username: account.username,
@@ -527,10 +644,12 @@ app.post('/accounts/signup', (req, res) => {
             birthday: account.birthday,
             gender: account.gender,
             avatarImage: account.avatarImage,
+            appearance: publicAppearance(account),
             robux: account.robux,
             tix: account.tix,
             inventory: account.inventory,
-            isAdmin: isAdminUsername(account.username)
+            isAdmin: isAdminUsername(account.username),
+            starterGame: starterGame ? publicGame(starterGame) : null
         });
     } catch (err) {
         console.error('Signup error:', err);
@@ -577,6 +696,7 @@ app.post('/accounts/login', (req, res) => {
             birthday: account.birthday,
             gender: account.gender,
             avatarImage: account.avatarImage || null,
+            appearance: publicAppearance(account),
             robux: account.robux || 0,
             tix: account.tix || 0,
             inventory: account.inventory || [],
@@ -617,6 +737,7 @@ app.get('/accounts/:username', (req, res) => {
         birthday: account.birthday,
         gender: account.gender,
         avatarImage: account.avatarImage || null,
+        appearance: publicAppearance(account),
         robux: account.robux || 0,
         tix: account.tix || 0,
         inventory: account.inventory || [],
@@ -643,8 +764,21 @@ app.post('/accounts/:username/avatar', (req, res) => {
     }
 
     account.avatarImage = avatarImage;
+
+    // Optional: the Avatar Editor sends its current equip state alongside every
+    // snapshot save, so "Currently Wearing" on the profile page can stay in sync
+    // without a separate round trip. Only known slots/string-or-null values are kept.
+    if (req.body.appearance && typeof req.body.appearance === 'object') {
+        if (!account.appearance || typeof account.appearance !== 'object') account.appearance = blankAppearance();
+        APPEARANCE_SLOTS.forEach(slot => {
+            const val = req.body.appearance[slot];
+            if (val === null) account.appearance[slot] = null;
+            else if (typeof val === 'string' && val.length > 0 && val.length <= 300) account.appearance[slot] = val;
+        });
+    }
+
     saveAccountsIndex();
-    res.json({ success: true });
+    res.json({ success: true, appearance: publicAppearance(account) });
 });
 
 // ---- List every buyable catalog item (currently: faces, 10 Tix each, all by RETROBLOX) ----
@@ -749,6 +883,7 @@ app.get('/accounts/:username/profile', (req, res) => {
         username: account.username,
         playerId: account.playerId,
         avatarImage: account.avatarImage || null,
+        appearance: publicAppearance(account),
         createdAt: account.createdAt,
         bio: account.bio || '',
         friendsCount: account.friends.length,
@@ -756,6 +891,19 @@ app.get('/accounts/:username/profile', (req, res) => {
         followingCount: account.following.length,
         relationship
     });
+});
+
+// ---- List every game a player has created/published (for the Creations section) ----
+app.get('/accounts/:username/creations', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    const showTakenDown = isAdminUsername(req.query.adminUsername);
+    const creations = games
+        .filter(g => g.creator.toLowerCase() === account.username.toLowerCase() && (showTakenDown || !g.takenDown))
+        .map(g => showTakenDown ? { ...publicGame(g), takenDown: !!g.takenDown, takedownReason: g.takedownReason || '' } : publicGame(g));
+
+    res.json(creations);
 });
 
 // ---- Update a player's bio (shown on their profile) ----
