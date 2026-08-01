@@ -1357,6 +1357,144 @@ app.post('/admin/players/:username/grant', (req, res) => {
     res.json({ success: true, account: publicAccount(account) });
 });
 
+// ================= SITE PRESENCE (online / in-game status shown on friends UI) =================
+// Tracks who currently has the site open in a browser tab (separate from being inside a
+// specific game's multiplayer room, which lives in gameStates below). The status shown
+// for a friend is: "in-game" if they're in any gameStates room, else "online" if they're
+// in sitePresence, else "offline".
+const sitePresence = {}; // lowercased username -> { socketId, username, lastSeen }
+
+// Find which game (if any) a username is currently connected to, by scanning every
+// live game room for a player whose name matches (case-insensitive).
+function findActiveGameForUsername(username) {
+    const lower = (username || '').toString().toLowerCase();
+    if (!lower) return null;
+    for (const gameId in gameStates) {
+        const room = gameStates[gameId];
+        for (const socketId in room) {
+            if ((room[socketId].name || '').toLowerCase() === lower) {
+                const g = games.find(x => x.id === gameId);
+                return { gameId, gameName: g ? g.name : 'a game' };
+            }
+        }
+    }
+    return null;
+}
+
+function presenceStatusFor(username) {
+    const activeGame = findActiveGameForUsername(username);
+    if (activeGame) return { status: 'in-game', gameId: activeGame.gameId, gameName: activeGame.gameName };
+    if (sitePresence[(username || '').toString().toLowerCase()]) return { status: 'online', gameId: null, gameName: null };
+    return { status: 'offline', gameId: null, gameName: null };
+}
+
+// ---- Look up online/in-game status for one or more usernames at once ----
+// GET /presence?usernames=alice,bob,carol
+app.get('/presence', (req, res) => {
+    const usernames = (req.query.usernames || '').toString().split(',').map(u => u.trim()).filter(Boolean);
+    const out = {};
+    usernames.forEach(u => { out[u] = presenceStatusFor(u); });
+    res.json(out);
+});
+
+// ================= DIRECT MESSAGES (site chat - separate from in-game chat) =================
+// Anyone with an account can message anyone else, friends or not. Conversations are
+// persisted the same way accounts/games are.
+const MESSAGES_FILE = path.join(DATA_DIR, 'messages.json');
+let conversations = [];
+try {
+    conversations = JSON.parse(fs.readFileSync(MESSAGES_FILE, 'utf8'));
+} catch (e) {
+    conversations = [];
+}
+function saveConversations() {
+    try {
+        fs.writeFileSync(MESSAGES_FILE, JSON.stringify(conversations, null, 2));
+    } catch (e) {
+        console.error('Failed to save messages:', e);
+    }
+}
+function conversationKey(a, b) {
+    return [a.toString().toLowerCase(), b.toString().toLowerCase()].sort().join('|');
+}
+function findOrCreateConversation(userA, userB) {
+    const key = conversationKey(userA, userB);
+    let convo = conversations.find(c => c.key === key);
+    if (!convo) {
+        convo = { key, users: [userA, userB], messages: [], lastRead: {}, updatedAt: Date.now() };
+        conversations.push(convo);
+    }
+    return convo;
+}
+function otherUserIn(convo, username) {
+    const lower = username.toString().toLowerCase();
+    return convo.users.find(u => u.toLowerCase() !== lower) || convo.users[0];
+}
+
+// ---- Send a direct message ----
+app.post('/messages/send', (req, res) => {
+    const from = (req.body.from || '').toString().trim();
+    const to = (req.body.to || '').toString().trim();
+    const text = (req.body.text || '').toString().trim().slice(0, 1000);
+    if (!from || !to || !text) return res.status(400).json({ error: 'missing-fields', message: 'from, to, and text are all required.' });
+    if (from.toLowerCase() === to.toLowerCase()) return res.status(400).json({ error: 'cannot-message-self', message: "You can't message yourself." });
+
+    if (!findAccountByUsername(from) || !findAccountByUsername(to)) {
+        return res.status(404).json({ error: 'no-account', message: 'One of these accounts does not exist.' });
+    }
+
+    const convo = findOrCreateConversation(from, to);
+    const message = { from, text, at: Date.now() };
+    convo.messages.push(message);
+    convo.updatedAt = message.at;
+    convo.lastRead[from.toLowerCase()] = message.at; // sending counts as having read your own message
+    saveConversations();
+
+    // Push it live if the recipient currently has the site open.
+    const recipientPresence = sitePresence[to.toLowerCase()];
+    if (recipientPresence) {
+        io.to(recipientPresence.socketId).emit('newMessage', { from, to, text, at: message.at });
+    }
+
+    res.json({ success: true, message });
+});
+
+// ---- List a user's conversations, most recently active first ----
+app.get('/messages/conversations/:username', (req, res) => {
+    const username = req.params.username;
+    const mine = conversations.filter(c => c.users.some(u => u.toLowerCase() === username.toLowerCase()));
+    mine.sort((a, b) => b.updatedAt - a.updatedAt);
+
+    const out = mine.map(c => {
+        const other = otherUserIn(c, username);
+        const otherAccount = findAccountByUsername(other);
+        const lastMessage = c.messages[c.messages.length - 1] || null;
+        const lastReadAt = c.lastRead[username.toLowerCase()] || 0;
+        const unread = c.messages.filter(m => m.from.toLowerCase() !== username.toLowerCase() && m.at > lastReadAt).length;
+        return {
+            username: other,
+            avatarImage: otherAccount ? (otherAccount.avatarImage || null) : null,
+            lastMessage: lastMessage ? lastMessage.text : '',
+            lastFrom: lastMessage ? lastMessage.from : null,
+            updatedAt: c.updatedAt,
+            unread
+        };
+    });
+    res.json(out);
+});
+
+// ---- Full message thread between two users - also marks it read for :username ----
+app.get('/messages/thread/:username/:otherUsername', (req, res) => {
+    const { username, otherUsername } = req.params;
+    const convo = conversations.find(c => c.key === conversationKey(username, otherUsername));
+    if (!convo) return res.json({ messages: [] });
+
+    convo.lastRead[username.toLowerCase()] = Date.now();
+    saveConversations();
+
+    res.json({ messages: convo.messages });
+});
+
 // ================= MULTIPLAYER (unchanged) =================
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -1371,6 +1509,15 @@ const io = new Server(server, {
 const gameStates = {};
 
 io.on('connection', (socket) => {
+    // ---- Site presence: client emits this once on connect (and again after a ----
+    // ---- reconnect) so friends can be shown "online" even outside a game.    ----
+    socket.on('sitePresence', (data) => {
+        const username = data && data.username;
+        if (!username) return;
+        socket.data.presenceUsername = username;
+        sitePresence[username.toLowerCase()] = { socketId: socket.id, username, lastSeen: Date.now() };
+    });
+
     socket.on('joinGame', ({ gameId, userData }) => {
         const account = findAccountByUsername((userData && userData.username) || '');
         if (account && liftBanIfExpired(account)) saveAccountsIndex();
@@ -1436,7 +1583,16 @@ io.on('connection', (socket) => {
         leaveAllGameRooms(socket);
     });
 
-    socket.on('disconnect', updateGlobalCounts);
+    socket.on('disconnect', () => {
+        const presenceUsername = socket.data && socket.data.presenceUsername;
+        if (presenceUsername) {
+            const entry = sitePresence[presenceUsername.toLowerCase()];
+            // Only clear if this socket is still the one on file - guards against a user
+            // with two tabs open where closing one shouldn't mark them offline.
+            if (entry && entry.socketId === socket.id) delete sitePresence[presenceUsername.toLowerCase()];
+        }
+        updateGlobalCounts();
+    });
 
     function leaveAllGameRooms(socket) {
         socket.rooms.forEach(room => {
