@@ -871,11 +871,14 @@ app.get('/accounts/:username/profile', (req, res) => {
     if (viewer && viewer.username.toLowerCase() !== account.username.toLowerCase()) {
         if (!Array.isArray(viewer.following)) viewer.following = [];
         if (!Array.isArray(viewer.blockedUsers)) viewer.blockedUsers = [];
+        if (!Array.isArray(account.friendRequests)) account.friendRequests = [];
         relationship = {
             isFriend: account.friends.some(f => f.toLowerCase() === viewer.username.toLowerCase()),
             isFollowing: viewer.following.some(u => u.toLowerCase() === account.username.toLowerCase()),
             isFollowedBy: account.following.some(u => u.toLowerCase() === viewer.username.toLowerCase()),
-            isBlocked: viewer.blockedUsers.some(u => u.toLowerCase() === account.username.toLowerCase())
+            isBlocked: viewer.blockedUsers.some(u => u.toLowerCase() === account.username.toLowerCase()),
+            // True once the viewer has sent this account a friend request that's still pending accept/decline.
+            requestSentByViewer: account.friendRequests.some(u => u.toLowerCase() === viewer.username.toLowerCase())
         };
     }
 
@@ -1064,6 +1067,12 @@ app.post('/accounts/:username/friends', (req, res) => {
         account.friends.push(friendAccount.username);
         friendAccount.friends.push(account.username);
         saveAccountsIndex();
+        // friendAccount was the original sender of the pending request we just satisfied -
+        // let them know live, the same way an explicit accept would.
+        const senderPresence = sitePresence[friendAccount.username.toLowerCase()];
+        if (senderPresence) {
+            io.to(senderPresence.socketId).emit('friendRequestAccepted', { by: account.username, at: Date.now() });
+        }
         return res.json({ success: true, status: 'auto-accepted', friends: account.friends, friendRequests: account.friendRequests });
     }
 
@@ -1074,6 +1083,17 @@ app.post('/accounts/:username/friends', (req, res) => {
 
     friendAccount.friendRequests.push(account.username);
     saveAccountsIndex();
+
+    // Push the request live to the recipient if they currently have the site/game open.
+    const recipientPresence = sitePresence[friendAccount.username.toLowerCase()];
+    if (recipientPresence) {
+        io.to(recipientPresence.socketId).emit('friendRequestReceived', {
+            from: account.username,
+            avatarImage: account.avatarImage || null,
+            at: Date.now()
+        });
+    }
+
     res.json({ success: true, status: 'requested' });
 });
 
@@ -1116,6 +1136,13 @@ app.post('/accounts/:username/friends/accept', (req, res) => {
     }
 
     saveAccountsIndex();
+
+    // Let the original sender know live that their request was accepted.
+    const senderPresence = sitePresence[friendUsername.toLowerCase()];
+    if (senderPresence) {
+        io.to(senderPresence.socketId).emit('friendRequestAccepted', { by: account.username, at: Date.now() });
+    }
+
     res.json({ success: true, friends: account.friends, friendRequests: account.friendRequests });
 });
 
@@ -1533,6 +1560,7 @@ io.on('connection', (socket) => {
             id: socket.id,
             name: userData.username || "Guest",
             appearance: userData.appearance || {},
+            avatarImage: userData.avatarImage || null,
             position: { x: 0, y: 5, z: 0 },
             rotation: { y: 0 },
             health: 100
