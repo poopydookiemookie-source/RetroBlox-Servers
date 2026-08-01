@@ -1613,6 +1613,76 @@ function updateGlobalCounts() {
     io.emit('playerCounts', counts);
 }
 
+// ================= STUDIO COLLABORATION (multiplayer editing + shared playtest) =================
+// A "studio session" is an ad-hoc room formed the moment someone opens the Multiplayer
+// plugin tab in Studio. Anyone invited who joins becomes part of studioRosters[sessionId].
+// Pressing Play broadcasts to the room so everyone enters play mode together, reusing the
+// exact same joinGame/updateState/etc events as the live game player (gameId = "studio_"+sessionId).
+const studioRosters = {}; // sessionId -> { [socketId]: { username } }
+
+io.on('connection', (socket) => {
+    // ---- Invite a friend to collaborate. Delivered live if they have the site open; ----
+    // ---- otherwise this is a no-op (studio invites are ephemeral, not persisted DMs). ----
+    socket.on('studioInvite', ({ from, to, sessionId, placeName }) => {
+        if (!from || !to || !sessionId) return;
+        const recipientPresence = sitePresence[to.toLowerCase()];
+        if (recipientPresence) {
+            io.to(recipientPresence.socketId).emit('studioInviteReceived', {
+                from, sessionId, placeName: placeName || 'Untitled Game', at: Date.now()
+            });
+        }
+    });
+
+    socket.on('studioJoinSession', ({ sessionId, username }) => {
+        if (!sessionId || !username) return;
+        const room = 'studio_' + sessionId;
+        socket.join(room);
+        socket.data.studioSessionId = sessionId;
+        socket.data.studioUsername = username;
+
+        if (!studioRosters[sessionId]) studioRosters[sessionId] = {};
+        studioRosters[sessionId][socket.id] = { username };
+
+        io.to(room).emit('studioRoster', studioRosters[sessionId]);
+    });
+
+    socket.on('studioLeaveSession', () => {
+        leaveStudioSession(socket);
+    });
+
+    // ---- Someone in the session hit Play - tell everyone (including the presser) to ----
+    // ---- enter play mode together, sharing gameId = "studio_"+sessionId. ----
+    socket.on('studioStartPlay', ({ sessionId }) => {
+        if (!sessionId) return;
+        io.to('studio_' + sessionId).emit('studioPlayStarted', { sessionId });
+    });
+
+    socket.on('studioStopPlay', ({ sessionId }) => {
+        if (!sessionId) return;
+        io.to('studio_' + sessionId).emit('studioPlayStopped', { sessionId });
+    });
+
+    socket.on('disconnecting', () => {
+        leaveStudioSession(socket);
+    });
+
+    function leaveStudioSession(socket) {
+        const sessionId = socket.data && socket.data.studioSessionId;
+        if (!sessionId) return;
+        const room = 'studio_' + sessionId;
+        if (studioRosters[sessionId]) {
+            delete studioRosters[sessionId][socket.id];
+            if (Object.keys(studioRosters[sessionId]).length === 0) {
+                delete studioRosters[sessionId];
+            } else {
+                io.to(room).emit('studioRoster', studioRosters[sessionId]);
+            }
+        }
+        socket.leave(room);
+        socket.data.studioSessionId = null;
+    }
+});
+
 // Ban-timer sweep: every minute, check every banned account with an expiry and lift
 // the ban if it's passed - this is what makes bans "automatically" expire even if
 // nobody happens to log in, load the admin panel, or try to join a game in the
