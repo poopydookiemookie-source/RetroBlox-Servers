@@ -68,6 +68,12 @@ accounts.forEach(a => {
     if (!Array.isArray(a.lastPlayed)) a.lastPlayed = [];
     if (!Array.isArray(a.likedGames)) a.likedGames = [];
     if (!Array.isArray(a.dislikedGames)) a.dislikedGames = [];
+    if (!Array.isArray(a.friendRequests)) a.friendRequests = [];
+    if (typeof a.avatarImage !== 'string') a.avatarImage = null;
+    if (typeof a.robux !== 'number' || isNaN(a.robux)) a.robux = 0;
+    if (typeof a.tix !== 'number' || isNaN(a.tix)) a.tix = 0;
+    if (typeof a.banned !== 'boolean') a.banned = false;
+    if (typeof a.banReason !== 'string') a.banReason = '';
 });
 
 function saveAccountsIndex() {
@@ -81,6 +87,31 @@ function saveAccountsIndex() {
 function findAccountByUsername(username) {
     const lower = (username || '').toString().toLowerCase();
     return accounts.find(a => a.username.toLowerCase() === lower);
+}
+
+// ================= ADMIN CONFIG =================
+// Only these two accounts can see/use the admin page (take down games, ban players).
+// NOTE: like the rest of this server, there are no session tokens - every route just
+// trusts whatever username the client sends. That matches the rest of the app's
+// (very informal) auth model, but means anyone who can read the client code could, in
+// theory, spoof an admin username in a raw request. Fine for a hobby project; do not
+// treat this as real production-grade access control.
+const ADMIN_USERNAMES = ['shaqman21', 'retroblox'];
+function isAdminUsername(username) {
+    return ADMIN_USERNAMES.includes((username || '').toString().trim().toLowerCase());
+}
+function requireAdmin(req, res) {
+    const adminUsername = (req.body.adminUsername || req.query.adminUsername || '').toString();
+    if (!isAdminUsername(adminUsername)) {
+        res.status(403).json({ error: 'not-admin', message: 'Admin access required.' });
+        return null;
+    }
+    const adminAccount = findAccountByUsername(adminUsername);
+    if (!adminAccount) {
+        res.status(403).json({ error: 'not-admin', message: 'Admin access required.' });
+        return null;
+    }
+    return adminAccount;
 }
 
 function hashPassword(password, salt) {
@@ -98,6 +129,21 @@ function publicGame(g) {
         likes: g.likes,
         dislikes: g.dislikes,
         createdAt: g.createdAt
+    };
+}
+
+// Public-safe view of an account for another user to see (friends list, friend
+// requests, admin player list) - never leaks salt/passwordHash.
+function publicAccount(a) {
+    return {
+        username: a.username,
+        avatarImage: a.avatarImage || null,
+        createdAt: a.createdAt,
+        robux: a.robux || 0,
+        tix: a.tix || 0,
+        banned: !!a.banned,
+        banReason: a.banReason || '',
+        friendsCount: Array.isArray(a.friends) ? a.friends.length : 0
     };
 }
 
@@ -124,13 +170,16 @@ app.get('/debug/storage', (req, res) => {
 
 // ---- List all games (used by the home page) ----
 app.get('/games', (req, res) => {
-    res.json(games.map(publicGame));
+    res.json(games.filter(g => !g.takenDown).map(publicGame));
 });
 
 // ---- Get a single game's metadata ----
 app.get('/games/:id', (req, res) => {
     const g = games.find(x => x.id === req.params.id);
     if (!g) return res.status(404).json({ error: 'Game not found' });
+    if (g.takenDown && !isAdminUsername(req.query.adminUsername)) {
+        return res.status(403).json({ error: 'taken-down', message: g.takedownReason || 'This game has been taken down by an administrator.' });
+    }
     res.json(publicGame(g));
 });
 
@@ -138,6 +187,9 @@ app.get('/games/:id', (req, res) => {
 app.get('/games/:id/content', (req, res) => {
     const g = games.find(x => x.id === req.params.id);
     if (!g) return res.status(404).send('Game not found');
+    if (g.takenDown && !isAdminUsername(req.query.adminUsername)) {
+        return res.status(403).send(g.takedownReason || 'This game has been taken down by an administrator.');
+    }
     const filePath = path.join(UPLOADS_DIR, g.filename);
     if (!fs.existsSync(filePath)) return res.status(404).send('Game file missing');
     res.type('application/json').send(fs.readFileSync(filePath, 'utf8'));
@@ -167,7 +219,9 @@ app.post('/upload', upload.single('file'), (req, res) => {
             dislikes: 0,
             likedBy: [],
             dislikedBy: [],
-            createdAt: Date.now()
+            createdAt: Date.now(),
+            takenDown: false,
+            takedownReason: ''
         };
 
         games.unshift(game);
@@ -314,16 +368,31 @@ app.post('/accounts/signup', (req, res) => {
             gender,
             createdAt: Date.now(),
             friends: [],
+            friendRequests: [],
             favorites: [],
             lastPlayed: [],
             likedGames: [],
-            dislikedGames: []
+            dislikedGames: [],
+            avatarImage: null,
+            robux: 0,
+            tix: 500, // small welcome bonus of classic-style Tix
+            banned: false,
+            banReason: ''
         };
 
         accounts.push(account);
         saveAccountsIndex();
 
-        res.json({ success: true, username: account.username, birthday: account.birthday, gender: account.gender });
+        res.json({
+            success: true,
+            username: account.username,
+            birthday: account.birthday,
+            gender: account.gender,
+            avatarImage: account.avatarImage,
+            robux: account.robux,
+            tix: account.tix,
+            isAdmin: isAdminUsername(account.username)
+        });
     } catch (err) {
         console.error('Signup error:', err);
         res.status(500).json({ error: 'signup-failed', message: 'Something went wrong creating your account.' });
@@ -346,7 +415,25 @@ app.post('/accounts/login', (req, res) => {
             return res.status(401).json({ error: 'wrong-password', message: 'Incorrect password.' });
         }
 
-        res.json({ success: true, username: account.username, birthday: account.birthday, gender: account.gender });
+        if (account.banned) {
+            return res.status(403).json({
+                error: 'banned',
+                message: account.banReason
+                    ? `This account has been banned. Reason: ${account.banReason}`
+                    : 'This account has been banned.'
+            });
+        }
+
+        res.json({
+            success: true,
+            username: account.username,
+            birthday: account.birthday,
+            gender: account.gender,
+            avatarImage: account.avatarImage || null,
+            robux: account.robux || 0,
+            tix: account.tix || 0,
+            isAdmin: isAdminUsername(account.username)
+        });
     } catch (err) {
         console.error('Login error:', err);
         res.status(500).json({ error: 'login-failed', message: 'Something went wrong logging in.' });
@@ -359,9 +446,49 @@ app.get('/accounts/exists', (req, res) => {
     res.json({ exists: !!findAccountByUsername(username) });
 });
 
+// ---- Fetch a fresh copy of "my own" account info (currency, avatar, admin/ban status). ----
+// Used on page load so a client that's been sitting on stale localStorage data always
+// re-syncs with the server (e.g. picks up a ban, or Robux/Tix an admin granted).
+app.get('/accounts/:username', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+    res.json({
+        username: account.username,
+        birthday: account.birthday,
+        gender: account.gender,
+        avatarImage: account.avatarImage || null,
+        robux: account.robux || 0,
+        tix: account.tix || 0,
+        isAdmin: isAdminUsername(account.username),
+        banned: !!account.banned,
+        banReason: account.banReason || ''
+    });
+});
+
+// ---- Save a snapshot image (data URL) of the account's current avatar, so friends can ----
+// ---- see it without needing to load a full 3D scene of their own. ----
+app.post('/accounts/:username/avatar', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    const avatarImage = (req.body.avatarImage || '').toString();
+    if (!avatarImage.startsWith('data:image/')) {
+        return res.status(400).json({ error: 'invalid-avatar', message: 'avatarImage must be a data:image/... URL.' });
+    }
+    if (avatarImage.length > 1_500_000) {
+        return res.status(400).json({ error: 'avatar-too-large', message: 'Avatar snapshot is too large.' });
+    }
+
+    account.avatarImage = avatarImage;
+    saveAccountsIndex();
+    res.json({ success: true });
+});
+
 // ================= FRIENDS =================
 
-// ---- Add a friend (mutual - adds both ways) ----
+// ---- Send a friend request (no longer auto-accepts). If the target already sent ----
+// ---- *you* a request, this instead accepts theirs, so two people requesting each ----
+// ---- other doesn't leave two pending requests sitting around forever. ----
 app.post('/accounts/:username/friends', (req, res) => {
     const account = findAccountByUsername(req.params.username);
     if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
@@ -377,16 +504,88 @@ app.post('/accounts/:username/friends', (req, res) => {
 
     if (!Array.isArray(account.friends)) account.friends = [];
     if (!Array.isArray(friendAccount.friends)) friendAccount.friends = [];
+    if (!Array.isArray(account.friendRequests)) account.friendRequests = [];
+    if (!Array.isArray(friendAccount.friendRequests)) friendAccount.friendRequests = [];
 
-    if (!account.friends.some(f => f.toLowerCase() === friendAccount.username.toLowerCase())) {
-        account.friends.push(friendAccount.username);
+    const alreadyFriends = account.friends.some(f => f.toLowerCase() === friendAccount.username.toLowerCase());
+    if (alreadyFriends) {
+        return res.json({ success: true, status: 'already-friends', friends: account.friends });
     }
-    if (!friendAccount.friends.some(f => f.toLowerCase() === account.username.toLowerCase())) {
+
+    // They already requested us -> accept theirs instead of creating a duplicate request.
+    const incomingIdx = account.friendRequests.findIndex(u => u.toLowerCase() === friendAccount.username.toLowerCase());
+    if (incomingIdx !== -1) {
+        account.friendRequests.splice(incomingIdx, 1);
+        friendAccount.friendRequests = friendAccount.friendRequests.filter(u => u.toLowerCase() !== account.username.toLowerCase());
+        account.friends.push(friendAccount.username);
         friendAccount.friends.push(account.username);
+        saveAccountsIndex();
+        return res.json({ success: true, status: 'auto-accepted', friends: account.friends, friendRequests: account.friendRequests });
+    }
+
+    const alreadyRequested = friendAccount.friendRequests.some(u => u.toLowerCase() === account.username.toLowerCase());
+    if (alreadyRequested) {
+        return res.json({ success: true, status: 'already-requested' });
+    }
+
+    friendAccount.friendRequests.push(account.username);
+    saveAccountsIndex();
+    res.json({ success: true, status: 'requested' });
+});
+
+// ---- List the friend requests *sent to* this account (pending, awaiting accept/decline) ----
+app.get('/accounts/:username/friends/requests', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+    if (!Array.isArray(account.friendRequests)) account.friendRequests = [];
+
+    const requests = account.friendRequests.map(u => {
+        const a = findAccountByUsername(u);
+        return { username: u, avatarImage: a ? (a.avatarImage || null) : null };
+    });
+    res.json(requests);
+});
+
+// ---- Accept a pending friend request (mutual - adds both ways) ----
+app.post('/accounts/:username/friends/accept', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    const friendUsername = (req.body.friendUsername || '').toString().trim();
+    if (!Array.isArray(account.friendRequests)) account.friendRequests = [];
+    if (!Array.isArray(account.friends)) account.friends = [];
+
+    const idx = account.friendRequests.findIndex(u => u.toLowerCase() === friendUsername.toLowerCase());
+    if (idx === -1) return res.status(404).json({ error: 'no-request', message: 'No pending request from that user.' });
+    account.friendRequests.splice(idx, 1);
+
+    if (!account.friends.some(f => f.toLowerCase() === friendUsername.toLowerCase())) {
+        account.friends.push(friendUsername);
+    }
+
+    const friendAccount = findAccountByUsername(friendUsername);
+    if (friendAccount) {
+        if (!Array.isArray(friendAccount.friends)) friendAccount.friends = [];
+        if (!friendAccount.friends.some(f => f.toLowerCase() === account.username.toLowerCase())) {
+            friendAccount.friends.push(account.username);
+        }
     }
 
     saveAccountsIndex();
-    res.json({ success: true, friends: account.friends });
+    res.json({ success: true, friends: account.friends, friendRequests: account.friendRequests });
+});
+
+// ---- Decline (dismiss) a pending friend request ----
+app.post('/accounts/:username/friends/decline', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    const friendUsername = (req.body.friendUsername || '').toString().trim();
+    if (!Array.isArray(account.friendRequests)) account.friendRequests = [];
+    account.friendRequests = account.friendRequests.filter(u => u.toLowerCase() !== friendUsername.toLowerCase());
+
+    saveAccountsIndex();
+    res.json({ success: true, friendRequests: account.friendRequests });
 });
 
 // ---- Remove a friend (mutual - removes both ways) ----
@@ -407,12 +606,17 @@ app.post('/accounts/:username/friends/remove', (req, res) => {
     res.json({ success: true, friends: account.friends });
 });
 
-// ---- List a user's friends ----
+// ---- List a user's friends (with avatar image, for display) ----
 app.get('/accounts/:username/friends', (req, res) => {
     const account = findAccountByUsername(req.params.username);
     if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
     if (!Array.isArray(account.friends)) account.friends = [];
-    res.json(account.friends);
+
+    const friends = account.friends.map(u => {
+        const a = findAccountByUsername(u);
+        return { username: u, avatarImage: a ? (a.avatarImage || null) : null };
+    });
+    res.json(friends);
 });
 
 // ================= FAVORITES =================
@@ -495,6 +699,91 @@ app.get('/accounts/:username/liked-games', (req, res) => {
     res.json(likedGames);
 });
 
+// ================= ADMIN (shaqman21 / RETROBLOX only) =================
+// Every route below requires an "adminUsername" (body for POST, query for GET) that
+// matches ADMIN_USERNAMES. See the note above isAdminUsername() for the security caveat.
+
+// ---- List every game (including taken-down ones) for the admin games panel ----
+app.get('/admin/games', (req, res) => {
+    if (!requireAdmin(req, res)) return;
+    res.json(games.map(g => ({
+        ...publicGame(g),
+        takenDown: !!g.takenDown,
+        takedownReason: g.takedownReason || ''
+    })));
+});
+
+// ---- Take a game down (hides it from /games and blocks play, but keeps the record) ----
+app.post('/admin/games/:id/takedown', (req, res) => {
+    if (!requireAdmin(req, res)) return;
+    const g = games.find(x => x.id === req.params.id);
+    if (!g) return res.status(404).json({ error: 'not-found', message: 'Game not found.' });
+
+    g.takenDown = true;
+    g.takedownReason = (req.body.reason || '').toString().slice(0, 300);
+    saveGamesIndex();
+    res.json({ success: true, game: { ...publicGame(g), takenDown: true, takedownReason: g.takedownReason } });
+});
+
+// ---- Restore a previously taken-down game ----
+app.post('/admin/games/:id/restore', (req, res) => {
+    if (!requireAdmin(req, res)) return;
+    const g = games.find(x => x.id === req.params.id);
+    if (!g) return res.status(404).json({ error: 'not-found', message: 'Game not found.' });
+
+    g.takenDown = false;
+    g.takedownReason = '';
+    saveGamesIndex();
+    res.json({ success: true, game: { ...publicGame(g), takenDown: false, takedownReason: '' } });
+});
+
+// ---- List every player account for the admin players panel ----
+app.get('/admin/players', (req, res) => {
+    if (!requireAdmin(req, res)) return;
+    res.json(accounts.map(publicAccount));
+});
+
+// ---- Ban a player (blocks login and multiplayer join) ----
+app.post('/admin/players/:username/ban', (req, res) => {
+    if (!requireAdmin(req, res)) return;
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+    if (isAdminUsername(account.username)) {
+        return res.status(400).json({ error: 'cannot-ban-admin', message: 'Admins cannot be banned.' });
+    }
+
+    account.banned = true;
+    account.banReason = (req.body.reason || '').toString().slice(0, 300);
+    saveAccountsIndex();
+    res.json({ success: true, account: publicAccount(account) });
+});
+
+// ---- Unban a player ----
+app.post('/admin/players/:username/unban', (req, res) => {
+    if (!requireAdmin(req, res)) return;
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    account.banned = false;
+    account.banReason = '';
+    saveAccountsIndex();
+    res.json({ success: true, account: publicAccount(account) });
+});
+
+// ---- Grant (or deduct, with a negative amount) Robux/Tix to a player ----
+app.post('/admin/players/:username/grant', (req, res) => {
+    if (!requireAdmin(req, res)) return;
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    const robuxDelta = Number(req.body.robux) || 0;
+    const tixDelta = Number(req.body.tix) || 0;
+    account.robux = Math.max(0, (account.robux || 0) + robuxDelta);
+    account.tix = Math.max(0, (account.tix || 0) + tixDelta);
+    saveAccountsIndex();
+    res.json({ success: true, account: publicAccount(account) });
+});
+
 // ================= MULTIPLAYER (unchanged) =================
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -510,6 +799,12 @@ const gameStates = {};
 
 io.on('connection', (socket) => {
     socket.on('joinGame', ({ gameId, userData }) => {
+        const account = findAccountByUsername((userData && userData.username) || '');
+        if (account && account.banned) {
+            socket.emit('banned', { reason: account.banReason || 'You have been banned.' });
+            return;
+        }
+
         socket.join(gameId);
         if (!gameStates[gameId]) gameStates[gameId] = {};
 
