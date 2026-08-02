@@ -1588,19 +1588,9 @@ socket.on('updateState', (data) => {
         }
     });
 
-    // ---- Chat: relay a message to everyone else in the same game room ----
+// ---- Chat: relay a message to everyone else in the same game room ----
     socket.on('chatMessage', (message) => {
         const room = Array.from(socket.rooms).find(r => gameStates[r]);
-        if (!room) return;
-        const text = (message || '').toString().slice(0, 200);
-        if (!text) return;
-        // Broadcast to everyone else in the room (sender already renders its own message locally)
-        socket.to(room).emit('chatMessage', { id: socket.id, message: text });
-    });
-    // ---- Chat: relay a message to everyone else in the same game room ----
-    socket.on('chatMessage', (message) => {
-        const rooms = Array.from(socket.rooms);
-        const room = rooms[1];
         if (!room) return;
         const text = (message || '').toString().slice(0, 200);
         if (!text) return;
