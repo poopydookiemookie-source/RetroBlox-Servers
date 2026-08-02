@@ -1571,9 +1571,8 @@ io.on('connection', (socket) => {
         updateGlobalCounts();
     });
 
-    socket.on('updateState', (data) => {
-        const rooms = Array.from(socket.rooms);
-        const room = rooms[1];
+socket.on('updateState', (data) => {
+        const room = Array.from(socket.rooms).find(r => gameStates[r]);
         if (room && gameStates[room] && gameStates[room][socket.id]) {
             Object.assign(gameStates[room][socket.id], data);
             socket.to(room).emit('peerUpdate', { id: socket.id, ...data });
@@ -1582,14 +1581,22 @@ io.on('connection', (socket) => {
 
     // ---- Appearance changed mid-session (e.g. player swaps a hat/shirt while playing) ----
     socket.on('updateAppearance', (appearance) => {
-        const rooms = Array.from(socket.rooms);
-        const room = rooms[1];
+        const room = Array.from(socket.rooms).find(r => gameStates[r]);
         if (room && gameStates[room] && gameStates[room][socket.id]) {
             gameStates[room][socket.id].appearance = appearance;
             socket.to(room).emit('peerAppearance', { id: socket.id, appearance });
         }
     });
 
+    // ---- Chat: relay a message to everyone else in the same game room ----
+    socket.on('chatMessage', (message) => {
+        const room = Array.from(socket.rooms).find(r => gameStates[r]);
+        if (!room) return;
+        const text = (message || '').toString().slice(0, 200);
+        if (!text) return;
+        // Broadcast to everyone else in the room (sender already renders its own message locally)
+        socket.to(room).emit('chatMessage', { id: socket.id, message: text });
+    });
     // ---- Chat: relay a message to everyone else in the same game room ----
     socket.on('chatMessage', (message) => {
         const rooms = Array.from(socket.rooms);
