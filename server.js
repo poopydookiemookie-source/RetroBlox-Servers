@@ -1553,6 +1553,21 @@ io.on('connection', (socket) => {
             return;
         }
 
+        // Defensive cleanup: a client is expected to emit 'leaveGame' before joining a
+        // different game, but if that ever gets skipped - a missed navigation event, a
+        // race on reconnect, a page that jumps straight from one game to the next - this
+        // socket would otherwise stay registered as a "ghost" player in its OLD game
+        // room forever, inflating that game's player count and leaving a stuck character
+        // other players can still see. A socket can only ever really be playing one game
+        // at a time, so force-leave every other game room before joining this one.
+        Array.from(socket.rooms).forEach(room => {
+            if (room !== gameId && gameStates[room] && gameStates[room][socket.id]) {
+                delete gameStates[room][socket.id];
+                socket.leave(room);
+                socket.to(room).emit('playerLeft', socket.id);
+            }
+        });
+
         socket.join(gameId);
         if (!gameStates[gameId]) gameStates[gameId] = {};
 
