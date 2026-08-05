@@ -476,6 +476,28 @@ app.post('/upload', upload.single('file'), (req, res) => {
     }
 });
 
+// ---- Edit a game's name/description/icon (used by the Studio "My Games" tab so a ----
+// ---- creator can restyle their game's listing without re-uploading the whole file). ----
+app.post('/games/:id/edit', (req, res) => {
+    const g = games.find(x => x.id === req.params.id);
+    if (!g) return res.status(404).json({ error: 'Game not found' });
+
+    const creator = (req.body.creator || '').toString().trim();
+    if (!creator || creator.toLowerCase() !== (g.creator || '').toString().trim().toLowerCase()) {
+        return res.status(403).json({ error: 'not-owner', message: 'Only the creator can edit this game.' });
+    }
+
+    if (typeof req.body.name === 'string' && req.body.name.trim()) g.name = req.body.name.toString().slice(0, 100);
+    if (typeof req.body.description === 'string') g.description = req.body.description.toString().slice(0, 2000);
+    if (typeof req.body.icon === 'string') {
+        if (req.body.icon === '') g.icon = null;
+        else if (req.body.icon.startsWith('data:image/') && req.body.icon.length <= 1_500_000) g.icon = req.body.icon;
+    }
+
+    saveGamesIndex();
+    res.json({ success: true, game: publicGame(g) });
+});
+
 // A logged-in user's vote identity is their username (stable across devices/browsers).
 // A logged-out user falls back to whatever anonymous userId the client generated.
 function voteIdentity(req, source) {
