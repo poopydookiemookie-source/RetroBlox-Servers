@@ -30,7 +30,19 @@ const GAMES_INDEX_FILE = path.join(DATA_DIR, 'games.json');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
+// Where uploaded catalog item images (Shirts/Pants/T-Shirts/Accessories/Faces from the
+// Item Creator plugin) get written. Same ephemeral-disk caveat as UPLOADS_DIR above.
+const CATALOG_UPLOADS_DIR = path.join(UPLOADS_DIR, 'catalog');
+if (!fs.existsSync(CATALOG_UPLOADS_DIR)) fs.mkdirSync(CATALOG_UPLOADS_DIR, { recursive: true });
+
 console.log(`[storage] Using DATA_DIR: ${DATA_DIR}`);
+
+// Public base URL other machines use to reach THIS server. Catalog item images are
+// served from our own disk (not bundled alongside display.html/studio.html the way
+// ./items/faces/*.png are), so their itemPath has to be a real absolute URL no matter
+// where the frontend happens to be hosted. Override via env var if this server's
+// address ever changes.
+const PUBLIC_SERVER_URL = process.env.PUBLIC_SERVER_URL || 'https://retroblox-servers.onrender.com';
 
 let games = [];
 try {
@@ -65,7 +77,7 @@ try {
 // Mirrors the equip categories the Avatar Editor already tracks client-side (see
 // AVATAR_CATALOGS in display.html) so a profile page can show what someone has equipped
 // without needing to load their full 3D avatar.
-const APPEARANCE_SLOTS = ['equippedFace', 'equippedHair', 'equippedAccessory', 'equippedShirt', 'equippedPants', 'equippedTShirt'];
+const APPEARANCE_SLOTS = ['equippedFace', 'equippedHat', 'equippedHair', 'equippedFaceAccessory', 'equippedNeck', 'equippedShoulder', 'equippedFront', 'equippedBack', 'equippedWaist', 'equippedShirt', 'equippedPants', 'equippedTShirt'];
 function blankAppearance() {
     const a = {};
     APPEARANCE_SLOTS.forEach(slot => { a[slot] = null; });
@@ -99,6 +111,13 @@ accounts.forEach(a => {
     if (typeof a.banExpiresAt !== 'number') a.banExpiresAt = null;
     if (typeof a.lastDailyRewardAt !== 'number') a.lastDailyRewardAt = 0;
     if (!a.appearance || typeof a.appearance !== 'object') a.appearance = {};
+    // Migrate the old single "equippedAccessory" slot (pre-dates the 7-category
+    // Hat/Hair/Face/Neck/Shoulder/Front/Back/Waist accessory system) into the new
+    // equippedHat slot, since that's what it always meant in practice.
+    if (typeof a.appearance.equippedAccessory === 'string' && a.appearance.equippedAccessory && !a.appearance.equippedHat) {
+        a.appearance.equippedHat = a.appearance.equippedAccessory;
+    }
+    delete a.appearance.equippedAccessory;
     APPEARANCE_SLOTS.forEach(slot => {
         if (typeof a.appearance[slot] !== 'string' || !a.appearance[slot]) a.appearance[slot] = null;
     });
@@ -204,7 +223,10 @@ function isAdminUsername(username) {
     return ADMIN_USERNAMES.includes((username || '').toString().trim().toLowerCase());
 }
 function requireAdmin(req, res) {
-    const adminUsername = (req.body.adminUsername || req.query.adminUsername || '').toString();
+    // req.body can be undefined on a GET request with no JSON content-type (depends on
+    // the exact body-parser version) - guard it so the admin GET panels (games,
+    // players, catalog) don't 500 when only ?adminUsername=... is sent.
+    const adminUsername = ((req.body && req.body.adminUsername) || req.query.adminUsername || '').toString();
     if (!isAdminUsername(adminUsername)) {
         res.status(403).json({ error: 'not-admin', message: 'Admin access required.' });
         return null;
@@ -264,21 +286,117 @@ function publicSearchAccount(a) {
 }
 
 // ================= CATALOG =================
-// Server-side source of truth for buyable avatar items and their prices, so a client
-// can never just send whatever price it wants to the /inventory/buy route. Every face
-// in the Avatar Editor is uploaded by RETROBLOX and costs 10 Tix.
-const CATALOG_FACE_FILES = ["crying.png", "dizzy.png", "funny.png", "goofy.png", "john.png", "manface.png", "scared.png", "superhappy.png", "tongue.png", "winningsmile.png", "woman.png"];
-const FACE_PRICE_TIX = 10;
-const CATALOG_ITEMS = CATALOG_FACE_FILES.map(file => ({
-    itemPath: `./items/faces/${file}`,
-    name: file.split('.')[0].replace(/_/g, ' '),
-    category: 'faces',
-    price: FACE_PRICE_TIX,
-    currency: 'tix',
-    creator: 'RETROBLOX'
-}));
+// Catalog items are user-generated content, uploaded from the Item Creator plugin in
+// Retroblox Studio. Shirts/Pants/T-Shirts are open to anyone; the 8 accessory kinds and
+// Faces can only be uploaded by admins (mirrors ADMIN_USERNAMES below - same rule faces
+// have always followed). Every item is persisted to disk (like games/accounts) and gets
+// a permanent, sequential item number the same way accounts get a playerId - the first
+// item ever uploaded (or seeded, see below) is #1.
+const CATALOG_ITEMS_FILE = path.join(DATA_DIR, 'catalog_items.json');
+const CATALOG_ID_COUNTER_FILE = path.join(DATA_DIR, 'catalog_id_counter.json');
+
+const CLOTHING_CATEGORIES = ['shirts', 'pants', 'tshirts'];
+const ACCESSORY_CATEGORIES = ['hats', 'hair', 'faceaccessories', 'neck', 'shoulder', 'front', 'back', 'waist']; // the 8 accessory kinds
+const FACE_CATEGORY = 'faces';
+const ALL_CATALOG_CATEGORIES = [...CLOTHING_CATEGORIES, ...ACCESSORY_CATEGORIES, FACE_CATEGORY];
+const ADMIN_ONLY_CATEGORIES = [...ACCESSORY_CATEGORIES, FACE_CATEGORY];
+// Which "Currently Wearing" equip slot (see APPEARANCE_SLOTS above) each category fills.
+const CATEGORY_APPEARANCE_SLOT = {
+    shirts: 'equippedShirt', pants: 'equippedPants', tshirts: 'equippedTShirt',
+    hats: 'equippedHat', hair: 'equippedHair', faceaccessories: 'equippedFaceAccessory',
+    neck: 'equippedNeck', shoulder: 'equippedShoulder', front: 'equippedFront',
+    back: 'equippedBack', waist: 'equippedWaist', faces: 'equippedFace'
+};
+const UPLOAD_FEE_ROBUX = 5;    // charged to the uploader every time, regardless of the item's own price/currency
+const MIN_ITEM_PRICE = 2;
+const MAX_ITEM_PRICE = 9999999;
+
+let catalogItems = [];
+try {
+    catalogItems = JSON.parse(fs.readFileSync(CATALOG_ITEMS_FILE, 'utf8'));
+    console.log(`[storage] Loaded ${catalogItems.length} catalog item(s) from ${CATALOG_ITEMS_FILE}`);
+} catch (e) {
+    catalogItems = [];
+    console.log(`[storage] No existing catalog_items.json found at ${CATALOG_ITEMS_FILE} (starting empty). Reason: ${e.code || e.message}`);
+}
+// Backfill fields for items saved before a field existed
+catalogItems.forEach(i => {
+    if (!Array.isArray(i.children)) i.children = [];
+    if (typeof i.takenDown !== 'boolean') i.takenDown = false;
+    if (typeof i.takedownReason !== 'string') i.takedownReason = '';
+    if (typeof i.description !== 'string') i.description = '';
+});
+
+function saveCatalogItemsIndex() {
+    try {
+        fs.writeFileSync(CATALOG_ITEMS_FILE, JSON.stringify(catalogItems, null, 2));
+    } catch (e) {
+        console.error('Failed to save catalog items index:', e);
+    }
+}
+
+let nextCatalogItemId = 1;
+try {
+    const counterData = JSON.parse(fs.readFileSync(CATALOG_ID_COUNTER_FILE, 'utf8'));
+    if (typeof counterData.next === 'number' && counterData.next > 0) nextCatalogItemId = counterData.next;
+} catch (e) {
+    // No counter file yet - fine, we'll create one below.
+}
+function saveCatalogIdCounter() {
+    try {
+        fs.writeFileSync(CATALOG_ID_COUNTER_FILE, JSON.stringify({ next: nextCatalogItemId }));
+    } catch (e) {
+        console.error('Failed to save catalog ID counter:', e);
+    }
+}
+
+// One-time seed: fold the original hardcoded RETROBLOX faces into the real catalog (so
+// they get real item numbers and show up alongside user uploads) the very first time
+// this server boots with the new catalog system. If catalog_items.json already exists
+// (even if someone emptied it out) this is skipped, so it only ever runs once.
+if (!fs.existsSync(CATALOG_ITEMS_FILE)) {
+    const SEED_FACE_FILES = ["crying.png", "dizzy.png", "funny.png", "goofy.png", "john.png", "manface.png", "scared.png", "superhappy.png", "tongue.png", "winningsmile.png", "woman.png"];
+    const now = Date.now();
+    SEED_FACE_FILES.forEach(file => {
+        catalogItems.push({
+            id: nextCatalogItemId++,
+            name: file.split('.')[0].replace(/_/g, ' '),
+            description: 'A classic Retroblox face.',
+            category: 'faces',
+            itemPath: `./items/faces/${file}`,
+            price: 10,
+            currency: 'tix',
+            creator: 'RETROBLOX',
+            createdAt: now,
+            takenDown: false,
+            takedownReason: '',
+            children: []
+        });
+    });
+    saveCatalogIdCounter();
+    saveCatalogItemsIndex();
+}
+
 function findCatalogItem(itemPath) {
-    return CATALOG_ITEMS.find(i => i.itemPath === itemPath);
+    return catalogItems.find(i => i.itemPath === itemPath);
+}
+function findCatalogItemById(id) {
+    return catalogItems.find(i => String(i.id) === String(id));
+}
+// Public-safe view of a catalog item, used by both the catalog grid and the item page.
+function publicCatalogItem(i) {
+    return {
+        id: i.id,
+        name: i.name,
+        description: i.description,
+        category: i.category,
+        itemPath: i.itemPath,
+        price: i.price,
+        currency: i.currency,
+        creator: i.creator,
+        createdAt: i.createdAt,
+        children: i.children || []
+    };
 }
 
 // ================= STARTER PLACE =================
@@ -803,9 +921,128 @@ app.post('/accounts/:username/avatar', (req, res) => {
     res.json({ success: true, appearance: publicAppearance(account) });
 });
 
-// ---- List every buyable catalog item (currently: faces, 10 Tix each, all by RETROBLOX) ----
+// Serve uploaded catalog item images (written by /catalog/upload below) as plain
+// static files, e.g. GET /catalog/image/14.png.
+app.use('/catalog/image', express.static(CATALOG_UPLOADS_DIR));
+
+// ---- List every buyable catalog item (Shirts/Pants/T-Shirts/Accessories/Faces) ----
 app.get('/catalog', (req, res) => {
-    res.json(CATALOG_ITEMS);
+    const showTakenDown = isAdminUsername(req.query.adminUsername);
+    res.json(catalogItems.filter(i => showTakenDown || !i.takenDown).map(i => ({
+        ...publicCatalogItem(i),
+        ...(showTakenDown ? { takenDown: !!i.takenDown, takedownReason: i.takedownReason || '' } : {})
+    })));
+});
+
+// ---- Get one catalog item's full detail (used by the item page) ----
+app.get('/catalog/:id', (req, res) => {
+    const item = findCatalogItemById(req.params.id);
+    if (!item) return res.status(404).json({ error: 'not-found', message: 'That catalog item does not exist.' });
+    res.json({
+        ...publicCatalogItem(item),
+        takenDown: !!item.takenDown,
+        takedownReason: item.takedownReason || ''
+    });
+});
+
+// ---- Upload a new catalog item from the Item Creator plugin (Retroblox Studio) ----
+// Shirts/Pants/T-Shirts are open to everyone; the 8 accessory kinds + Faces require an
+// admin account. Costs a flat UPLOAD_FEE_ROBUX regardless of the item's own price.
+const catalogImageUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 5 * 1024 * 1024 } // 5MB - these are avatar-sized icons/textures, not game files
+});
+app.post('/catalog/upload', catalogImageUpload.single('image'), (req, res) => {
+    try {
+        const account = findAccountByUsername((req.body.username || '').toString());
+        if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found. Log in to upload catalog items.' });
+        if (liftBanIfExpired(account)) saveAccountsIndex();
+        if (account.banned) return res.status(403).json({ error: 'banned', message: 'Banned accounts cannot upload catalog items.' });
+
+        const category = (req.body.category || '').toString().toLowerCase().trim();
+        if (!ALL_CATALOG_CATEGORIES.includes(category)) {
+            return res.status(400).json({ error: 'invalid-category', message: 'Not a valid catalog category.' });
+        }
+        const isAdmin = isAdminUsername(account.username);
+        if (ADMIN_ONLY_CATEGORIES.includes(category) && !isAdmin) {
+            return res.status(403).json({ error: 'admin-only-category', message: 'Only admins can upload accessories or faces.' });
+        }
+
+        const name = (req.body.name || '').toString().trim().slice(0, 60);
+        if (!name) return res.status(400).json({ error: 'missing-name', message: 'Give this item a name.' });
+
+        const description = (req.body.description || '').toString().trim().slice(0, 1000);
+        if (!description) return res.status(400).json({ error: 'missing-description', message: 'A description is required to upload a catalog item.' });
+
+        const price = Math.round(Number(req.body.price));
+        if (!Number.isFinite(price) || price < MIN_ITEM_PRICE || price > MAX_ITEM_PRICE) {
+            return res.status(400).json({ error: 'invalid-price', message: `Price must be between ${MIN_ITEM_PRICE} and ${MAX_ITEM_PRICE}.` });
+        }
+
+        const currency = (req.body.currency || '').toString().toLowerCase().trim();
+        if (currency !== 'robux' && currency !== 'tix') {
+            return res.status(400).json({ error: 'invalid-currency', message: 'Currency must be Robux or Tix.' });
+        }
+
+        if (!req.file) return res.status(400).json({ error: 'no-image', message: 'An image (PNG or JPG) is required.' });
+        const mime = (req.file.mimetype || '').toLowerCase();
+        const ALLOWED_MIMES = ['image/png', 'image/jpeg', 'image/jpg'];
+        if (!ALLOWED_MIMES.includes(mime)) {
+            return res.status(400).json({ error: 'invalid-file-type', message: 'Catalog images must be a PNG or JPG file.' });
+        }
+
+        if ((account.robux || 0) < UPLOAD_FEE_ROBUX) {
+            return res.status(400).json({ error: 'insufficient-robux', message: `Uploading costs ${UPLOAD_FEE_ROBUX} Robux - you don't have enough.` });
+        }
+
+        // Optional: accessory "children" (particle emitters, lights, etc. attached to
+        // the item) - admin-only, and just data for now. Rendering them is future work;
+        // this only lays the groundwork so items can carry the data around. Capped hard
+        // so a malformed/huge payload can't bloat the catalog index.
+        let children = [];
+        if (isAdmin && typeof req.body.childrenJson === 'string' && req.body.childrenJson) {
+            try {
+                const parsed = JSON.parse(req.body.childrenJson);
+                if (Array.isArray(parsed)) {
+                    children = parsed.slice(0, 20).map(c => ({
+                        type: ((c && c.type) || 'Unknown').toString().slice(0, 40),
+                        name: ((c && c.name) || '').toString().slice(0, 60)
+                    }));
+                }
+            } catch (e) { /* ignore malformed children payload */ }
+        }
+
+        const ext = mime === 'image/png' ? '.png' : '.jpg';
+        const id = nextCatalogItemId++;
+        saveCatalogIdCounter();
+        const filename = `${id}${ext}`;
+        fs.writeFileSync(path.join(CATALOG_UPLOADS_DIR, filename), req.file.buffer);
+
+        account.robux = (account.robux || 0) - UPLOAD_FEE_ROBUX;
+        saveAccountsIndex();
+
+        const item = {
+            id,
+            name,
+            description,
+            category,
+            itemPath: `${PUBLIC_SERVER_URL}/catalog/image/${filename}`,
+            price,
+            currency,
+            creator: account.username,
+            createdAt: Date.now(),
+            takenDown: false,
+            takedownReason: '',
+            children
+        };
+        catalogItems.push(item);
+        saveCatalogItemsIndex();
+
+        res.json({ success: true, item: publicCatalogItem(item), robux: account.robux });
+    } catch (err) {
+        console.error('Catalog upload error:', err);
+        res.status(500).json({ error: 'upload-failed', message: 'Something went wrong uploading that item.' });
+    }
 });
 
 // ================= INVENTORY =================
@@ -818,7 +1055,8 @@ app.get('/accounts/:username/inventory', (req, res) => {
     res.json({ inventory: account.inventory });
 });
 
-// ---- Buy a catalog item with Tix (currently only faces are sold) ----
+// ---- Buy a catalog item with Robux or Tix (whichever currency it's priced in). ----
+// ---- If it was uploaded by a real player, that player is paid the full sale price. ----
 app.post('/accounts/:username/inventory/buy', (req, res) => {
     const account = findAccountByUsername(req.params.username);
     if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
@@ -828,18 +1066,30 @@ app.post('/accounts/:username/inventory/buy', (req, res) => {
     const itemPath = (req.body.itemPath || '').toString();
     const item = findCatalogItem(itemPath);
     if (!item) return res.status(400).json({ error: 'invalid-item', message: 'That item is not in the catalog.' });
+    if (item.takenDown) {
+        return res.status(403).json({ error: 'taken-down', message: item.takedownReason || 'This item has been taken down by an administrator.' });
+    }
 
     if (!Array.isArray(account.inventory)) account.inventory = [];
     if (account.inventory.includes(itemPath)) {
         return res.json({ success: true, status: 'already-owned', tix: account.tix, robux: account.robux, inventory: account.inventory });
     }
 
-    if ((account.tix || 0) < item.price) {
-        return res.status(400).json({ error: 'insufficient-tix', message: `You need ${item.price} Tix to buy this item.` });
+    const currencyField = item.currency === 'robux' ? 'robux' : 'tix';
+    const label = currencyField === 'robux' ? 'Robux' : 'Tix';
+    if ((account[currencyField] || 0) < item.price) {
+        return res.status(400).json({ error: `insufficient-${currencyField}`, message: `You need ${item.price} ${label} to buy this item.` });
     }
 
-    account.tix -= item.price;
+    account[currencyField] -= item.price;
     account.inventory.push(itemPath);
+
+    // Pay the creator, unless it's a system item (the original RETROBLOX-uploaded faces).
+    const creatorAccount = findAccountByUsername(item.creator);
+    if (creatorAccount) {
+        creatorAccount[currencyField] = (creatorAccount[currencyField] || 0) + item.price;
+    }
+
     saveAccountsIndex();
     res.json({ success: true, status: 'purchased', tix: account.tix, robux: account.robux, inventory: account.inventory });
 });
@@ -1328,6 +1578,41 @@ app.post('/admin/games/:id/restore', (req, res) => {
     g.takedownReason = '';
     saveGamesIndex();
     res.json({ success: true, game: { ...publicGame(g), takenDown: false, takedownReason: '' } });
+});
+
+// ---- List every catalog item (including taken-down ones) for the admin catalog panel ----
+app.get('/admin/catalog', (req, res) => {
+    if (!requireAdmin(req, res)) return;
+    res.json(catalogItems.map(i => ({
+        ...publicCatalogItem(i),
+        takenDown: !!i.takenDown,
+        takedownReason: i.takedownReason || ''
+    })));
+});
+
+// ---- Take a catalog item down (hides it from /catalog and blocks new purchases, but ----
+// ---- keeps the record - existing owners keep it, same as a taken-down game). ----
+app.post('/admin/catalog/:id/takedown', (req, res) => {
+    if (!requireAdmin(req, res)) return;
+    const item = findCatalogItemById(req.params.id);
+    if (!item) return res.status(404).json({ error: 'not-found', message: 'Catalog item not found.' });
+
+    item.takenDown = true;
+    item.takedownReason = (req.body.reason || '').toString().slice(0, 300);
+    saveCatalogItemsIndex();
+    res.json({ success: true, item: { ...publicCatalogItem(item), takenDown: true, takedownReason: item.takedownReason } });
+});
+
+// ---- Restore a previously taken-down catalog item ----
+app.post('/admin/catalog/:id/restore', (req, res) => {
+    if (!requireAdmin(req, res)) return;
+    const item = findCatalogItemById(req.params.id);
+    if (!item) return res.status(404).json({ error: 'not-found', message: 'Catalog item not found.' });
+
+    item.takenDown = false;
+    item.takedownReason = '';
+    saveCatalogItemsIndex();
+    res.json({ success: true, item: { ...publicCatalogItem(item), takenDown: false, takedownReason: '' } });
 });
 
 // ---- List every player account for the admin players panel ----
