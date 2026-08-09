@@ -942,11 +942,7 @@ app.use('/catalog/image', express.static(CATALOG_UPLOADS_DIR));
 
 // ---- List every buyable catalog item (Shirts/Pants/T-Shirts/Accessories/Faces) ----
 app.get('/catalog', (req, res) => {
-    const showTakenDown = isAdminUsername(req.query.adminUsername);
-    res.json(catalogItems.filter(i => showTakenDown || !i.takenDown).map(i => ({
-        ...publicCatalogItem(i),
-        ...(showTakenDown ? { takenDown: !!i.takenDown, takedownReason: i.takedownReason || '' } : {})
-    })));
+    res.json(catalogItems.map(i => publicCatalogItem(i)));
 });
 
 // ---- Get one catalog item's full detail (used by the item page) ----
@@ -1659,39 +1655,55 @@ app.post('/admin/games/:id/restore', (req, res) => {
     res.json({ success: true, game: { ...publicGame(g), takenDown: false, takedownReason: '' } });
 });
 
-// ---- List every catalog item (including taken-down ones) for the admin catalog panel ----
+// ---- List every catalog item for the admin catalog panel ----
 app.get('/admin/catalog', (req, res) => {
     if (!requireAdmin(req, res)) return;
-    res.json(catalogItems.map(i => ({
-        ...publicCatalogItem(i),
-        takenDown: !!i.takenDown,
-        takedownReason: i.takedownReason || ''
-    })));
+    res.json(catalogItems.map(i => publicCatalogItem(i)));
 });
 
-// ---- Take a catalog item down (hides it from /catalog and blocks new purchases, but ----
-// ---- keeps the record - existing owners keep it, same as a taken-down game). ----
-app.post('/admin/catalog/:id/takedown', (req, res) => {
+// ---- Permanently delete a catalog item: removes the catalog record, its on-disk ----
+// ---- image file (accessories store their model data inline in the JSON, so there's ----
+// ---- no file for those), and unequips it from every account that currently has it ----
+// ---- on - otherwise anyone wearing a deleted item is left with a dangling reference ----
+// ---- that fails to load (the classic "stuck all-white" bug), fixable only by manually ----
+// ---- re-equipping something else. Ownership entries in inventories are left alone so ----
+// ---- purchase history isn't erased, but the item can never be equipped again since it's gone.
+app.post('/admin/catalog/:id/delete', (req, res) => {
     if (!requireAdmin(req, res)) return;
-    const item = findCatalogItemById(req.params.id);
-    if (!item) return res.status(404).json({ error: 'not-found', message: 'Catalog item not found.' });
+    const itemIndex = catalogItems.findIndex(i => String(i.id) === String(req.params.id));
+    if (itemIndex === -1) return res.status(404).json({ error: 'not-found', message: 'Catalog item not found.' });
+    const item = catalogItems[itemIndex];
+    const itemPath = item.itemPath;
 
-    item.takenDown = true;
-    item.takedownReason = (req.body.reason || '').toString().slice(0, 300);
+    // Remove the on-disk image file for clothing/face items. Accessory (3D model)
+    // items keep their data inline in catalog_items.json, not as a separate file.
+    if (itemPath && itemPath.includes('/catalog/image/')) {
+        const filename = itemPath.split('/catalog/image/')[1];
+        if (filename && !filename.includes('..') && !filename.includes('/')) {
+            const filePath = path.join(CATALOG_UPLOADS_DIR, filename);
+            fs.unlink(filePath, err => {
+                if (err && err.code !== 'ENOENT') console.error('Failed to delete catalog image file:', err);
+            });
+        }
+    }
+
+    catalogItems.splice(itemIndex, 1);
     saveCatalogItemsIndex();
-    res.json({ success: true, item: { ...publicCatalogItem(item), takenDown: true, takedownReason: item.takedownReason } });
-});
 
-// ---- Restore a previously taken-down catalog item ----
-app.post('/admin/catalog/:id/restore', (req, res) => {
-    if (!requireAdmin(req, res)) return;
-    const item = findCatalogItemById(req.params.id);
-    if (!item) return res.status(404).json({ error: 'not-found', message: 'Catalog item not found.' });
+    // Unequip this item from anyone currently wearing it.
+    let accountsChanged = false;
+    accounts.forEach(a => {
+        if (!a.appearance || typeof a.appearance !== 'object') return;
+        APPEARANCE_SLOTS.forEach(slot => {
+            if (a.appearance[slot] === itemPath) {
+                a.appearance[slot] = null;
+                accountsChanged = true;
+            }
+        });
+    });
+    if (accountsChanged) saveAccountsIndex();
 
-    item.takenDown = false;
-    item.takedownReason = '';
-    saveCatalogItemsIndex();
-    res.json({ success: true, item: { ...publicCatalogItem(item), takenDown: false, takedownReason: '' } });
+    res.json({ success: true, deletedId: item.id });
 });
 
 // ---- List every player account for the admin players panel ----
