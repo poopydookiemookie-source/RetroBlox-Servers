@@ -352,32 +352,11 @@ function saveCatalogIdCounter() {
     }
 }
 
-// One-time seed: fold the original hardcoded RETROBLOX faces into the real catalog (so
-// they get real item numbers and show up alongside user uploads) the very first time
-// this server boots with the new catalog system. If catalog_items.json already exists
-// (even if someone emptied it out) this is skipped, so it only ever runs once.
-if (!fs.existsSync(CATALOG_ITEMS_FILE)) {
-    const SEED_FACE_FILES = ["crying.png", "dizzy.png", "funny.png", "goofy.png", "john.png", "manface.png", "scared.png", "superhappy.png", "tongue.png", "winningsmile.png", "woman.png"];
-    const now = Date.now();
-    SEED_FACE_FILES.forEach(file => {
-        catalogItems.push({
-            id: nextCatalogItemId++,
-            name: file.split('.')[0].replace(/_/g, ' '),
-            description: 'A classic Retroblox face.',
-            category: 'faces',
-            itemPath: `./items/faces/${file}`,
-            price: 10,
-            currency: 'tix',
-            creator: 'RETROBLOX',
-            createdAt: now,
-            takenDown: false,
-            takedownReason: '',
-            children: []
-        });
-    });
-    saveCatalogIdCounter();
-    saveCatalogItemsIndex();
-}
+// Faces used to auto-seed from a hardcoded list of built-in images the first time this
+// server booted. That's disabled now - the catalog is strictly player uploads only, so
+// this block intentionally does nothing. (Old servers that already ran the seed once
+// still have those items sitting in catalog_items.json - remove them by hand there, or
+// via the admin catalog panel, if you want them gone too.)
 
 function findCatalogItem(itemPath) {
     return catalogItems.find(i => i.itemPath === itemPath);
