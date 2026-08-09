@@ -325,6 +325,8 @@ catalogItems.forEach(i => {
     if (typeof i.takenDown !== 'boolean') i.takenDown = false;
     if (typeof i.takedownReason !== 'string') i.takedownReason = '';
     if (typeof i.description !== 'string') i.description = '';
+    if (i.modelFormat === undefined) i.modelFormat = null;
+    if (i.modelData === undefined) i.modelData = null;
 });
 
 function saveCatalogItemsIndex() {
@@ -383,7 +385,40 @@ function findCatalogItem(itemPath) {
 function findCatalogItemById(id) {
     return catalogItems.find(i => String(i.id) === String(id));
 }
+
+// Real property schemas matching Studio's actual PointLight/SpotLight/ParticleEmitter
+// objects (see window.non3DItems in studio.html) - so a child stored on a catalog
+// accessory can be spawned as a genuine child instance the moment it's equipped,
+// instead of being just descriptive text. Unknown types/fields are dropped rather than
+// stored as-is, since this data eventually gets pushed straight into a live 3D scene.
+const CHILD_SCHEMAS = {
+    PointLight: { Color: 'color', Brightness: 'number', Range: 'number' },
+    SpotLight: { Color: 'color', Brightness: 'number', Range: 'number', Angle: 'number' },
+    ParticleEmitter: { Color: 'color', Size: 'number', Rate: 'number' }
+};
+function sanitizeAccessoryChild(c) {
+    if (!c || typeof c !== 'object') return null;
+    const type = (c.type || '').toString();
+    const schema = CHILD_SCHEMAS[type];
+    if (!schema) return null;
+
+    const out = { type, name: (c.name || type).toString().slice(0, 60) };
+    for (const [field, kind] of Object.entries(schema)) {
+        const raw = c[field];
+        if (kind === 'color') {
+            out[field] = /^#[0-9a-fA-F]{6}$/.test(raw) ? raw : '#ffffff';
+        } else if (kind === 'number') {
+            const n = Number(raw);
+            out[field] = Number.isFinite(n) ? Math.max(0, Math.min(n, 1000)) : 1;
+        }
+    }
+    return out;
+}
+
 // Public-safe view of a catalog item, used by both the catalog grid and the item page.
+// modelFormat tells the client which loader to use for an accessory's itemPath (see
+// GET /catalog/model/:id below); the raw modelData itself is NOT included here, since
+// it can be several MB and the catalog grid/list only needs it on demand.
 function publicCatalogItem(i) {
     return {
         id: i.id,
@@ -391,6 +426,7 @@ function publicCatalogItem(i) {
         description: i.description,
         category: i.category,
         itemPath: i.itemPath,
+        modelFormat: i.modelFormat || null,
         price: i.price,
         currency: i.currency,
         creator: i.creator,
@@ -921,8 +957,8 @@ app.post('/accounts/:username/avatar', (req, res) => {
     res.json({ success: true, appearance: publicAppearance(account) });
 });
 
-// Serve uploaded catalog item images (written by /catalog/upload below) as plain
-// static files, e.g. GET /catalog/image/14.png.
+// Serve uploaded catalog item images (clothing/faces - written by /catalog/upload
+// below) as plain static files, e.g. GET /catalog/image/14.png.
 app.use('/catalog/image', express.static(CATALOG_UPLOADS_DIR));
 
 // ---- List every buyable catalog item (Shirts/Pants/T-Shirts/Accessories/Faces) ----
@@ -945,13 +981,47 @@ app.get('/catalog/:id', (req, res) => {
     });
 });
 
+// ---- Serve an accessory's raw 3D model data (written by /catalog/upload below). ----
+// The trailing "extension" in the URL (e.g. /catalog/model/14.glb) is purely a hint for
+// whatever client fetches it (GLTFLoader/OBJLoader/JSON.parse - see itemPath below) -
+// this route ignores everything after the leading digits, so /catalog/model/14 and
+// /catalog/model/14.glb both resolve to item #14.
+app.get('/catalog/model/:id', (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const item = findCatalogItemById(id);
+    if (!item || !item.modelData) return res.status(404).send('Model not found.');
+
+    const CONTENT_TYPES = {
+        glb: 'model/gltf-binary',
+        gltf: 'model/gltf+json',
+        obj: 'text/plain; charset=utf-8',
+        parts: 'application/json'
+    };
+    res.set('Content-Type', CONTENT_TYPES[item.modelFormat] || 'application/octet-stream');
+
+    if (item.modelFormat === 'glb') {
+        // Stored as base64 text (it's binary data) - decode back to real bytes.
+        res.send(Buffer.from(item.modelData, 'base64'));
+    } else {
+        // gltf/obj/parts are all stored as plain text (JSON or OBJ source).
+        res.send(item.modelData);
+    }
+});
+
 // ---- Upload a new catalog item from the Item Creator plugin (Retroblox Studio) ----
-// Shirts/Pants/T-Shirts are open to everyone; the 8 accessory kinds + Faces require an
-// admin account. Costs a flat UPLOAD_FEE_ROBUX regardless of the item's own price.
+// Shirts/Pants/T-Shirts are open to everyone and are still plain PNG/JPG images. The 8
+// accessory kinds + Faces require an admin account; Faces stay images too, but
+// accessories are now real 3D models (.glb/.gltf/.obj, or .rbxm/.rbxmx pre-converted to
+// a portable "parts" JSON by Studio's own importer before it ever reaches this route -
+// see the Item Creator plugin) instead of a flat picture. Costs a flat
+// UPLOAD_FEE_ROBUX either way, regardless of the item's own price.
 const catalogImageUpload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 5 * 1024 * 1024 } // 5MB - these are avatar-sized icons/textures, not game files
+    limits: { fileSize: 5 * 1024 * 1024, fieldSize: 20 * 1024 * 1024 } // images stay small; fieldSize covers a base64 model in modelData
 });
+const MODEL_FORMATS = ['glb', 'gltf', 'obj', 'parts'];
+const MAX_MODEL_DATA_CHARS = 15 * 1024 * 1024; // ~15MB of text (base64 GLB, gltf JSON, obj source, or parts JSON)
+
 app.post('/catalog/upload', catalogImageUpload.single('image'), (req, res) => {
     try {
         const account = findAccountByUsername((req.body.username || '').toString());
@@ -967,6 +1037,7 @@ app.post('/catalog/upload', catalogImageUpload.single('image'), (req, res) => {
         if (ADMIN_ONLY_CATEGORIES.includes(category) && !isAdmin) {
             return res.status(403).json({ error: 'admin-only-category', message: 'Only admins can upload accessories or faces.' });
         }
+        const isAccessoryUpload = ACCESSORY_CATEGORIES.includes(category);
 
         const name = (req.body.name || '').toString().trim().slice(0, 60);
         if (!name) return res.status(400).json({ error: 'missing-name', message: 'Give this item a name.' });
@@ -984,39 +1055,66 @@ app.post('/catalog/upload', catalogImageUpload.single('image'), (req, res) => {
             return res.status(400).json({ error: 'invalid-currency', message: 'Currency must be Robux or Tix.' });
         }
 
-        if (!req.file) return res.status(400).json({ error: 'no-image', message: 'An image (PNG or JPG) is required.' });
-        const mime = (req.file.mimetype || '').toLowerCase();
-        const ALLOWED_MIMES = ['image/png', 'image/jpeg', 'image/jpg'];
-        if (!ALLOWED_MIMES.includes(mime)) {
-            return res.status(400).json({ error: 'invalid-file-type', message: 'Catalog images must be a PNG or JPG file.' });
-        }
-
         if ((account.robux || 0) < UPLOAD_FEE_ROBUX) {
             return res.status(400).json({ error: 'insufficient-robux', message: `Uploading costs ${UPLOAD_FEE_ROBUX} Robux - you don't have enough.` });
         }
 
         // Optional: accessory "children" (particle emitters, lights, etc. attached to
-        // the item) - admin-only, and just data for now. Rendering them is future work;
-        // this only lays the groundwork so items can carry the data around. Capped hard
-        // so a malformed/huge payload can't bloat the catalog index.
+        // the item) - admin-only. These get real property schemas matching Studio's
+        // actual PointLight/SpotLight/ParticleEmitter objects, since the whole point is
+        // that they become real child instances the moment the accessory is equipped,
+        // not just descriptive text.
         let children = [];
-        if (isAdmin && typeof req.body.childrenJson === 'string' && req.body.childrenJson) {
+        if (isAdmin && isAccessoryUpload && typeof req.body.childrenJson === 'string' && req.body.childrenJson) {
             try {
                 const parsed = JSON.parse(req.body.childrenJson);
-                if (Array.isArray(parsed)) {
-                    children = parsed.slice(0, 20).map(c => ({
-                        type: ((c && c.type) || 'Unknown').toString().slice(0, 40),
-                        name: ((c && c.name) || '').toString().slice(0, 60)
-                    }));
-                }
+                if (Array.isArray(parsed)) children = parsed.slice(0, 20).map(sanitizeAccessoryChild).filter(Boolean);
             } catch (e) { /* ignore malformed children payload */ }
         }
 
-        const ext = mime === 'image/png' ? '.png' : '.jpg';
         const id = nextCatalogItemId++;
         saveCatalogIdCounter();
-        const filename = `${id}${ext}`;
-        fs.writeFileSync(path.join(CATALOG_UPLOADS_DIR, filename), req.file.buffer);
+
+        let itemPath, modelFormat = null, modelData = null;
+
+        if (isAccessoryUpload) {
+            // Accessories: a real 3D model, sent as text (see the Item Creator plugin -
+            // .glb becomes a base64 string, .gltf/.obj/.parts are sent as plain text/JSON).
+            modelFormat = (req.body.modelFormat || '').toString().toLowerCase().trim();
+            if (!MODEL_FORMATS.includes(modelFormat)) {
+                return res.status(400).json({ error: 'invalid-model-format', message: 'Accessories need a .glb, .gltf, .obj, .rbxm or .rbxmx model.' });
+            }
+            modelData = (req.body.modelData || '').toString();
+            if (!modelData) {
+                return res.status(400).json({ error: 'no-model', message: 'No 3D model was attached to this upload.' });
+            }
+            if (modelData.length > MAX_MODEL_DATA_CHARS) {
+                return res.status(400).json({ error: 'model-too-large', message: 'That model is too large (try keeping it under ~10MB).' });
+            }
+            if (modelFormat === 'parts') {
+                // Sanity-check it's actually valid JSON with a parts array before storing.
+                try {
+                    const parsed = JSON.parse(modelData);
+                    if (!parsed || !Array.isArray(parsed.parts)) throw new Error('missing parts array');
+                } catch (e) {
+                    return res.status(400).json({ error: 'invalid-model-data', message: 'That .rbxm/.rbxmx file could not be converted to a model.' });
+                }
+            }
+            const ext = modelFormat === 'parts' ? 'json' : modelFormat;
+            itemPath = `${PUBLIC_SERVER_URL}/catalog/model/${id}.${ext}`;
+        } else {
+            // Clothing/Faces: still a plain PNG/JPG image, uploaded as a real file.
+            if (!req.file) return res.status(400).json({ error: 'no-image', message: 'An image (PNG or JPG) is required.' });
+            const mime = (req.file.mimetype || '').toLowerCase();
+            const ALLOWED_MIMES = ['image/png', 'image/jpeg', 'image/jpg'];
+            if (!ALLOWED_MIMES.includes(mime)) {
+                return res.status(400).json({ error: 'invalid-file-type', message: 'Catalog images must be a PNG or JPG file.' });
+            }
+            const imgExt = mime === 'image/png' ? '.png' : '.jpg';
+            const filename = `${id}${imgExt}`;
+            fs.writeFileSync(path.join(CATALOG_UPLOADS_DIR, filename), req.file.buffer);
+            itemPath = `${PUBLIC_SERVER_URL}/catalog/image/${filename}`;
+        }
 
         account.robux = (account.robux || 0) - UPLOAD_FEE_ROBUX;
         saveAccountsIndex();
@@ -1026,7 +1124,9 @@ app.post('/catalog/upload', catalogImageUpload.single('image'), (req, res) => {
             name,
             description,
             category,
-            itemPath: `${PUBLIC_SERVER_URL}/catalog/image/${filename}`,
+            itemPath,
+            modelFormat,
+            modelData,
             price,
             currency,
             creator: account.username,
