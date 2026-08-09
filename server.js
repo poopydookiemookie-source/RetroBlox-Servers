@@ -365,15 +365,21 @@ function findCatalogItemById(id) {
     return catalogItems.find(i => String(i.id) === String(id));
 }
 
-// Real property schemas matching Studio's actual PointLight/SpotLight/ParticleEmitter
-// objects (see window.non3DItems in studio.html) - so a child stored on a catalog
-// accessory can be spawned as a genuine child instance the moment it's equipped,
-// instead of being just descriptive text. Unknown types/fields are dropped rather than
-// stored as-is, since this data eventually gets pushed straight into a live 3D scene.
+// Real property schemas matching Studio's actual PointLight/SpotLight/ParticleEmitter/
+// Sparkles/Fire/Smoke objects (see window.non3DItems in studio.html) - so a child stored
+// on a catalog accessory can be spawned as a genuine child instance the moment it's
+// equipped, instead of being just descriptive text. Unknown types/fields are dropped
+// rather than stored as-is, since this data eventually gets pushed straight into a live
+// 3D scene. Each field's default (used when a value is missing/invalid) matches that
+// property's default in Studio's own Add Effect menu, so a Fire without an explicit
+// SecondaryColor still comes out gold instead of white, etc.
 const CHILD_SCHEMAS = {
-    PointLight: { Color: 'color', Brightness: 'number', Range: 'number' },
-    SpotLight: { Color: 'color', Brightness: 'number', Range: 'number', Angle: 'number' },
-    ParticleEmitter: { Color: 'color', Size: 'number', Rate: 'number' }
+    PointLight: { Color: { kind: 'color', default: '#ffffff' }, Brightness: { kind: 'number', default: 1 }, Range: { kind: 'number', default: 12 } },
+    SpotLight: { Color: { kind: 'color', default: '#ffffff' }, Brightness: { kind: 'number', default: 1 }, Range: { kind: 'number', default: 16 }, Angle: { kind: 'number', default: 90 } },
+    ParticleEmitter: { Color: { kind: 'color', default: '#ffffff' }, Size: { kind: 'number', default: 1 }, Rate: { kind: 'number', default: 20 } },
+    Sparkles: { Color: { kind: 'color', default: '#ffffff' }, Size: { kind: 'number', default: 1 }, Rate: { kind: 'number', default: 20 } },
+    Fire: { Color: { kind: 'color', default: '#FF8C00' }, SecondaryColor: { kind: 'color', default: '#FFD700' }, Size: { kind: 'number', default: 8 }, Heat: { kind: 'number', default: 9 } },
+    Smoke: { Color: { kind: 'color', default: '#808080' }, Size: { kind: 'number', default: 1 }, Opacity: { kind: 'number', default: 0.5, max: 1 }, RiseVelocity: { kind: 'number', default: 1 } }
 };
 function sanitizeAccessoryChild(c) {
     if (!c || typeof c !== 'object') return null;
@@ -382,13 +388,14 @@ function sanitizeAccessoryChild(c) {
     if (!schema) return null;
 
     const out = { type, name: (c.name || type).toString().slice(0, 60) };
-    for (const [field, kind] of Object.entries(schema)) {
+    for (const [field, def] of Object.entries(schema)) {
         const raw = c[field];
-        if (kind === 'color') {
-            out[field] = /^#[0-9a-fA-F]{6}$/.test(raw) ? raw : '#ffffff';
-        } else if (kind === 'number') {
+        if (def.kind === 'color') {
+            out[field] = /^#[0-9a-fA-F]{6}$/.test(raw) ? raw : def.default;
+        } else if (def.kind === 'number') {
             const n = Number(raw);
-            out[field] = Number.isFinite(n) ? Math.max(0, Math.min(n, 1000)) : 1;
+            const max = def.max !== undefined ? def.max : 1000;
+            out[field] = Number.isFinite(n) ? Math.max(0, Math.min(n, max)) : def.default;
         }
     }
     return out;
