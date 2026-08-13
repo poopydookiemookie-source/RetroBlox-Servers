@@ -327,6 +327,8 @@ catalogItems.forEach(i => {
     if (typeof i.description !== 'string') i.description = '';
     if (i.modelFormat === undefined) i.modelFormat = null;
     if (i.modelData === undefined) i.modelData = null;
+    if (i.originalPosition === undefined) i.originalPosition = null;
+    if (i.originalSize === undefined) i.originalSize = null;
 });
 
 function saveCatalogItemsIndex() {
@@ -381,6 +383,24 @@ const CHILD_SCHEMAS = {
     Fire: { Color: { kind: 'color', default: '#FF8C00' }, SecondaryColor: { kind: 'color', default: '#FFD700' }, Size: { kind: 'number', default: 8 }, Heat: { kind: 'number', default: 9 } },
     Smoke: { Color: { kind: 'color', default: '#808080' }, Size: { kind: 'number', default: 1 }, Opacity: { kind: 'number', default: 0.5, max: 1 }, RiseVelocity: { kind: 'number', default: 1 } }
 };
+// A per-accessory position/size adjusted on the reference NPC in Studio's Accessory
+// Editor tab (see window.buildAccessoryAttachmentHierarchy in studio.html) - a plain
+// [x,y,z] array of finite numbers, or null if never provided/malformed. Stored on the
+// catalog item as originalPosition/originalSize and handed back down so any client
+// (Studio, the website's item page, or player.js on real equip) can rebuild the exact
+// same Handle/[Type]Attachment/OriginalPosition/OriginalSize hierarchy the creator saw,
+// instead of falling back to the generic per-type default.
+function sanitizeVec3(raw) {
+    let arr;
+    try { arr = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch (e) { return null; }
+    if (!Array.isArray(arr) || arr.length !== 3) return null;
+    const nums = arr.map(Number);
+    if (!nums.every(Number.isFinite)) return null;
+    // Clamp to a sane range - this only ever describes a small local offset/scale
+    // multiplier, never a world-space coordinate, so anything huge is bogus input.
+    return nums.map(n => Math.max(-1000, Math.min(1000, n)));
+}
+
 function sanitizeAccessoryChild(c) {
     if (!c || typeof c !== 'object') return null;
     const type = (c.type || '').toString();
@@ -417,7 +437,9 @@ function publicCatalogItem(i) {
         currency: i.currency,
         creator: i.creator,
         createdAt: i.createdAt,
-        children: i.children || []
+        children: i.children || [],
+        originalPosition: i.originalPosition || null,
+        originalSize: i.originalSize || null
     };
 }
 
@@ -1054,6 +1076,16 @@ app.post('/catalog/upload', catalogImageUpload.single('image'), (req, res) => {
             } catch (e) { /* ignore malformed children payload */ }
         }
 
+        // Optional: this accessory's position/size, adjusted on the reference NPC in
+        // Studio's Accessory Editor tab. Stored so any client can rebuild the exact same
+        // Handle/[Type]Attachment/OriginalPosition/OriginalSize hierarchy on real equip
+        // instead of falling back to the generic per-type default offset.
+        let originalPosition = null, originalSize = null;
+        if (isAccessoryUpload) {
+            originalPosition = sanitizeVec3(req.body.originalPosition);
+            originalSize = sanitizeVec3(req.body.originalSize);
+        }
+
         const id = nextCatalogItemId++;
         saveCatalogIdCounter();
 
@@ -1115,7 +1147,9 @@ app.post('/catalog/upload', catalogImageUpload.single('image'), (req, res) => {
             createdAt: Date.now(),
             takenDown: false,
             takedownReason: '',
-            children
+            children,
+            originalPosition,
+            originalSize
         };
         catalogItems.push(item);
         saveCatalogItemsIndex();
