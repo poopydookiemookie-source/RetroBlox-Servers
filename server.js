@@ -9,7 +9,9 @@ const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '15mb' }));
+// 20mb (not 15mb) so a near-max-size Toolbox asset upload (see MAX_TOOLBOX_MODEL_CHARS
+// below, ~15MB of model JSON alone) still fits once name/description/thumbnail are added.
+app.use(express.json({ limit: '20mb' }));
 
 // ================= GAME STORAGE SETUP =================
 // Games are persisted to disk so they survive server restarts.
@@ -1158,6 +1160,150 @@ app.post('/catalog/upload', catalogImageUpload.single('image'), (req, res) => {
     } catch (err) {
         console.error('Catalog upload error:', err);
         res.status(500).json({ error: 'upload-failed', message: 'Something went wrong uploading that item.' });
+    }
+});
+
+// ================= TOOLBOX ASSETS =================
+// Assets uploaded from Retroblox Studio's Explorer right-click menu ("Upload to
+// Retroblox..." on a selected Part/Model/etc). Unlike the Catalog above (wearable
+// clothing/accessories, admin-gated for most categories, costs Robux), Toolbox assets
+// are just plain building-block content - anyone can upload one for free, and every
+// uploaded asset immediately shows up for every Studio user in their Toolbox panel,
+// ready to insert into any place. This mirrors how Roblox's real Toolbox ("My
+// Models"/community models) works, simplified down to "free and open to everyone" per
+// how this project's Studio is set up (no per-account moderation queue).
+//
+// The model itself is stored as our own serializeHierarchy() JSON - the exact same
+// shape Studio's Cut/Copy/Paste already round-trips through (see deserializeHierarchy)
+// - rather than a real binary .rbxm. That keeps a Toolbox asset 100% lossless when it
+// comes back down into another Studio session, at the cost of only being readable by
+// this Studio (not real Roblox). Studio's own "Save to File..." offers the same JSON
+// wrapped in a ".rbxm" file extension for a local download, for consistency.
+const TOOLBOX_ASSETS_FILE = path.join(DATA_DIR, 'toolbox_assets.json');
+const TOOLBOX_ID_COUNTER_FILE = path.join(DATA_DIR, 'toolbox_id_counter.json');
+
+let toolboxAssets = [];
+try {
+    toolboxAssets = JSON.parse(fs.readFileSync(TOOLBOX_ASSETS_FILE, 'utf8'));
+    console.log(`[storage] Loaded ${toolboxAssets.length} toolbox asset(s) from ${TOOLBOX_ASSETS_FILE}`);
+} catch (e) {
+    toolboxAssets = [];
+    console.log(`[storage] No existing toolbox_assets.json found at ${TOOLBOX_ASSETS_FILE} (starting empty). Reason: ${e.code || e.message}`);
+}
+// Backfill fields for assets saved before a field existed
+toolboxAssets.forEach(a => {
+    if (typeof a.takenDown !== 'boolean') a.takenDown = false;
+    if (typeof a.takedownReason !== 'string') a.takedownReason = '';
+    if (typeof a.description !== 'string') a.description = '';
+});
+
+function saveToolboxAssetsIndex() {
+    try {
+        fs.writeFileSync(TOOLBOX_ASSETS_FILE, JSON.stringify(toolboxAssets, null, 2));
+    } catch (e) {
+        console.error('Failed to save toolbox assets index:', e);
+    }
+}
+
+let nextToolboxAssetId = 1;
+try {
+    const counterData = JSON.parse(fs.readFileSync(TOOLBOX_ID_COUNTER_FILE, 'utf8'));
+    if (typeof counterData.next === 'number' && counterData.next > 0) nextToolboxAssetId = counterData.next;
+} catch (e) {
+    // No counter file yet - fine, we'll create one below.
+}
+function saveToolboxIdCounter() {
+    try {
+        fs.writeFileSync(TOOLBOX_ID_COUNTER_FILE, JSON.stringify({ next: nextToolboxAssetId }));
+    } catch (e) {
+        console.error('Failed to save toolbox ID counter:', e);
+    }
+}
+
+function findToolboxAssetById(id) {
+    const numId = parseInt(id, 10);
+    return toolboxAssets.find(a => a.id === numId);
+}
+
+// List view (used by the Toolbox panel's grid) - excludes the (potentially large)
+// model JSON itself, same reasoning as publicCatalogItem excluding modelData.
+function publicToolboxAsset(a) {
+    return {
+        id: a.id,
+        name: a.name,
+        description: a.description,
+        creator: a.creator,
+        createdAt: a.createdAt,
+        thumbnail: a.thumbnail || null
+    };
+}
+
+const MAX_TOOLBOX_MODEL_CHARS = 15 * 1024 * 1024; // ~15MB of JSON - generous for a hand-built model
+
+// ---- List every Toolbox asset (open to anyone, no login/ownership filter) ----
+app.get('/toolbox/assets', (req, res) => {
+    res.json(toolboxAssets.filter(a => !a.takenDown).map(publicToolboxAsset));
+});
+
+// ---- Get one Toolbox asset's full model data (used when the user clicks it in the ----
+// ---- Toolbox panel to actually insert it into their place). ----
+app.get('/toolbox/assets/:id', (req, res) => {
+    const asset = findToolboxAssetById(req.params.id);
+    if (!asset) return res.status(404).json({ error: 'not-found', message: 'That asset does not exist.' });
+    if (asset.takenDown) return res.status(403).json({ error: 'taken-down', message: asset.takedownReason || 'This asset has been taken down.' });
+    res.json({
+        id: asset.id,
+        name: asset.name,
+        description: asset.description,
+        creator: asset.creator,
+        createdAt: asset.createdAt,
+        model: asset.model
+    });
+});
+
+// ---- Upload a new asset from Retroblox Studio's Explorer right-click menu ----
+// ("Upload to Retroblox..."). Open to anyone - no account, fee, or admin check, unlike
+// the Catalog above. `model` is the JSON produced by Studio's own serializeHierarchy().
+app.post('/toolbox/upload', (req, res) => {
+    try {
+        const name = (req.body.name || '').toString().trim().slice(0, 60) || 'Untitled Asset';
+        const description = (req.body.description || '').toString().trim().slice(0, 1000);
+        const creator = (req.body.creator || '').toString().trim().slice(0, 60) || 'Guest';
+
+        const model = req.body.model;
+        if (!model || typeof model !== 'object') {
+            return res.status(400).json({ error: 'no-model', message: 'No model data was included in this upload.' });
+        }
+        const modelStr = JSON.stringify(model);
+        if (modelStr.length > MAX_TOOLBOX_MODEL_CHARS) {
+            return res.status(400).json({ error: 'model-too-large', message: 'That selection is too large to upload (try uploading a smaller piece of it).' });
+        }
+
+        const thumbnail = (typeof req.body.thumbnail === 'string' && req.body.thumbnail.startsWith('data:'))
+            ? req.body.thumbnail
+            : null;
+
+        const id = nextToolboxAssetId++;
+        saveToolboxIdCounter();
+
+        const asset = {
+            id,
+            name,
+            description,
+            creator,
+            model,
+            thumbnail,
+            createdAt: Date.now(),
+            takenDown: false,
+            takedownReason: ''
+        };
+        toolboxAssets.push(asset);
+        saveToolboxAssetsIndex();
+
+        res.json({ success: true, id: asset.id, asset: publicToolboxAsset(asset) });
+    } catch (err) {
+        console.error('Toolbox upload error:', err);
+        res.status(500).json({ error: 'upload-failed', message: 'Something went wrong uploading that asset.' });
     }
 });
 
