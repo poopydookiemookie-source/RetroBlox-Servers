@@ -370,7 +370,7 @@ function findCatalogItemById(id) {
 }
 
 // Real property schemas matching Studio's actual PointLight/SpotLight/ParticleEmitter/
-// Sparkles/Fire/Smoke objects (see window.non3DItems in studio.html) - so a child stored
+// Sparkles/Fire/Smoke objects (see window.non3DItems in editor.html) - so a child stored
 // on a catalog accessory can be spawned as a genuine child instance the moment it's
 // equipped, instead of being just descriptive text. Unknown types/fields are dropped
 // rather than stored as-is, since this data eventually gets pushed straight into a live
@@ -386,7 +386,7 @@ const CHILD_SCHEMAS = {
     Smoke: { Color: { kind: 'color', default: '#808080' }, Size: { kind: 'number', default: 1 }, Opacity: { kind: 'number', default: 0.5, max: 1 }, RiseVelocity: { kind: 'number', default: 1 } }
 };
 // A per-accessory position/size adjusted on the reference NPC in Studio's Accessory
-// Editor tab (see window.buildAccessoryAttachmentHierarchy in studio.html) - a plain
+// Editor tab (see window.buildAccessoryAttachmentHierarchy in editor.html) - a plain
 // [x,y,z] array of finite numbers, or null if never provided/malformed. Stored on the
 // catalog item as originalPosition/originalSize and handed back down so any client
 // (Studio, the website's item page, or player.js on real equip) can rebuild the exact
@@ -451,8 +451,8 @@ function publicCatalogItem(i) {
 //
 // This mirrors exactly what Retroblox Studio itself starts a brand-new project with
 // (see the "Baseplate Application" section + the StarterPlayerScripts/CharacterScripts/
-// Camera/Terrain setup near the top of studio.html) and what its own "Export .crbx" /
-// "Publish" flow serializes (getCrbxData() in studio.html): a single 512x20x512-stud
+// Camera/Terrain setup near the top of editor.html) and what its own "Export .crbx" /
+// "Publish" flow serializes (getCrbxData() in editor.html): a single 512x20x512-stud
 // grey Baseplate sitting at y:-10 (top face at y:0), plus the Camera/Terrain/StarterPlayer
 // script-folder entries Studio always creates. There's no explicit SpawnLocation - Studio's
 // own play/test code falls back to spawning at (0, 5, 0) when no spawnpoint block exists,
