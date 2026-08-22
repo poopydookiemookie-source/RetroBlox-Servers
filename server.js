@@ -1977,6 +1977,20 @@ app.post('/toolbox/upload', (req, res) => {
     }
 });
 
+// ---- List a specific account's own Toolbox uploads (Studio Creations -> Development ----
+// ---- Items -> Models/Packages) - distinct from GET /toolbox/assets above, which is ----
+// ---- the global, everyone's-assets Toolbox panel list. ----
+app.get('/accounts/:username/toolbox-assets', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    const assets = toolboxAssets
+        .filter(a => a.creator.toLowerCase() === account.username.toLowerCase() && !a.takenDown)
+        .map(publicToolboxAsset);
+
+    res.json(assets);
+});
+
 // ================= INVENTORY =================
 
 // ---- Get a player's owned catalog items ----
