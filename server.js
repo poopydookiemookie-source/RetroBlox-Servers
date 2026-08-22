@@ -662,6 +662,41 @@ app.post('/games/:id/edit', (req, res) => {
     res.json({ success: true, game: publicGame(g) });
 });
 
+// ---- Overwrite an existing game's saved content (used by Studio's "My Games" ----
+// ---- edit flow: open a previously-uploaded game, make changes, save back to the ----
+// ---- same game id instead of always creating a new one via /upload). ----
+app.post('/games/:id/content', upload.single('file'), (req, res) => {
+    const g = games.find(x => x.id === req.params.id);
+    if (!g) return res.status(404).json({ error: 'Game not found' });
+
+    const creator = (req.body.creator || '').toString().trim();
+    if (!creator || creator.toLowerCase() !== (g.creator || '').toString().trim().toLowerCase()) {
+        return res.status(403).json({ error: 'not-owner', message: 'Only the creator can save changes to this game.' });
+    }
+
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+    try {
+        // Overwrite the same file on disk this game has always used (g.filename was
+        // fixed at initial /upload time) rather than writing a new one, so the game's
+        // id/filename/likes/createdAt all stay exactly as they were.
+        fs.writeFileSync(path.join(UPLOADS_DIR, g.filename), req.file.buffer);
+
+        if (typeof req.body.name === 'string' && req.body.name.trim()) g.name = req.body.name.toString().slice(0, 100);
+        if (typeof req.body.description === 'string') g.description = req.body.description.toString().slice(0, 2000);
+        if (typeof req.body.icon === 'string') {
+            if (req.body.icon === '') g.icon = null;
+            else if (req.body.icon.startsWith('data:image/')) g.icon = req.body.icon;
+        }
+
+        saveGamesIndex();
+        res.json({ success: true, game: publicGame(g) });
+    } catch (err) {
+        console.error('Save content error:', err);
+        res.status(500).json({ error: 'Save failed', details: err.message });
+    }
+});
+
 // A logged-in user's vote identity is their username (stable across devices/browsers).
 // A logged-out user falls back to whatever anonymous userId the client generated.
 function voteIdentity(req, source) {
