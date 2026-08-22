@@ -258,7 +258,20 @@ function publicGame(g) {
         createdAt: g.createdAt,
         isPrivate: !!g.isPrivate,
         archived: !!g.archived,
-        archivedAt: g.archivedAt || null
+        archivedAt: g.archivedAt || null,
+        // Upload Options plugin fields (Retroblox Studio > Plugins tab > Retroblox
+        // Plugins > Upload Options). maxPlayers/serverCount back the simulated
+        // multi-server "Join Server" list on the game page until real per-server
+        // routing (TeleportService, etc.) exists - see display.html.
+        maturityRating: g.maturityRating || 'Everyone',
+        genre: g.genre || 'All',
+        theme: g.theme || 'None',
+        gearsAllowed: !!g.gearsAllowed,
+        allowCopying: !!g.allowCopying,
+        allowThirdPartyTeleports: !!g.allowThirdPartyTeleports,
+        maxPlayers: g.maxPlayers || 10,
+        serverCount: g.serverCount || 1,
+        defaultRigType: g.defaultRigType || 'PlayerChoice'
     };
 }
 
@@ -271,6 +284,33 @@ function canViewPrivateGame(g, viewerUsername) {
     if (viewer.toLowerCase() === (g.creator || '').toString().trim().toLowerCase()) return true;
     return isAdminUsername(viewer);
 }
+
+// Parses/validates the Upload Options plugin's fields out of a multipart body
+// (req.body, all strings) for both /upload and /games/:id/content - shared so
+// the two endpoints can't drift on allowed values or clamping.
+const VALID_MATURITY_RATINGS = ['Everyone', 'Nine Plus', 'Teen', 'Mature'];
+const VALID_RIG_TYPES = ['PlayerChoice', 'R6', 'R15'];
+function parseUploadOptionsFields(body) {
+    const maturityRating = VALID_MATURITY_RATINGS.includes(body.maturityRating) ? body.maturityRating : 'Everyone';
+    const defaultRigType = VALID_RIG_TYPES.includes(body.defaultRigType) ? body.defaultRigType : 'PlayerChoice';
+    // Genre/Theme aren't validated against a fixed list server-side - the client's
+    // <select> already constrains them, and a free-form fallback here is harmless.
+    const genre = (body.genre || 'All').toString().slice(0, 40);
+    const theme = (body.theme || 'None').toString().slice(0, 40);
+    const gearsAllowed = body.gearsAllowed === 'true';
+    const allowCopying = body.allowCopying === 'true';
+    const allowThirdPartyTeleports = body.allowThirdPartyTeleports === 'true';
+    // Clamp 1-50 same as the plugin's two sliders.
+    let maxPlayers = parseInt(body.maxPlayers, 10);
+    if (!Number.isFinite(maxPlayers)) maxPlayers = 10;
+    maxPlayers = Math.min(50, Math.max(1, maxPlayers));
+    let serverCount = parseInt(body.serverCount, 10);
+    if (!Number.isFinite(serverCount)) serverCount = 1;
+    serverCount = Math.min(50, Math.max(1, serverCount));
+
+    return { maturityRating, defaultRigType, genre, theme, gearsAllowed, allowCopying, allowThirdPartyTeleports, maxPlayers, serverCount };
+}
+
 
 // Public-safe view of an account for another user to see (friends list, friend
 // requests, admin player list) - never leaks salt/passwordHash.
@@ -640,6 +680,8 @@ app.post('/upload', upload.single('file'), (req, res) => {
             ? req.body.icon
             : null; // No icon uploaded -> client will fall back to the default image
 
+        const uploadOptions = parseUploadOptionsFields(req.body);
+
         const game = {
             id,
             name: (req.body.name || 'Untitled Game').toString().slice(0, 100),
@@ -656,7 +698,8 @@ app.post('/upload', upload.single('file'), (req, res) => {
             takedownReason: '',
             isPrivate: false,
             archived: false,
-            archivedAt: null
+            archivedAt: null,
+            ...uploadOptions
         };
 
         games.unshift(game);
@@ -716,6 +759,14 @@ app.post('/games/:id/content', upload.single('file'), (req, res) => {
         if (typeof req.body.icon === 'string') {
             if (req.body.icon === '') g.icon = null;
             else if (req.body.icon.startsWith('data:image/')) g.icon = req.body.icon;
+        }
+        // Upload Options plugin fields - only present when Studio actually sent them
+        // (older cached clients might not), so only overwrite when at least one of
+        // them showed up on this request.
+        if (req.body.maturityRating !== undefined || req.body.defaultRigType !== undefined ||
+            req.body.genre !== undefined || req.body.theme !== undefined ||
+            req.body.maxPlayers !== undefined || req.body.serverCount !== undefined) {
+            Object.assign(g, parseUploadOptionsFields(req.body));
         }
 
         saveGamesIndex();
