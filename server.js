@@ -260,9 +260,9 @@ function publicGame(g) {
         archived: !!g.archived,
         archivedAt: g.archivedAt || null,
         // Upload Options plugin fields (Retroblox Studio > Plugins tab > Retroblox
-        // Plugins > Upload Options). maxPlayers/serverCount back the simulated
-        // multi-server "Join Server" list on the game page until real per-server
-        // routing (TeleportService, etc.) exists - see display.html.
+        // Plugins > Upload Options). maxPlayers caps each real server instance -
+        // see the INSTANCING section below for how many instances actually exist
+        // and GET /games/:id/instances for their live player counts.
         maturityRating: g.maturityRating || 'Everyone',
         genre: g.genre || 'All',
         theme: g.theme || 'None',
@@ -270,7 +270,6 @@ function publicGame(g) {
         allowCopying: !!g.allowCopying,
         allowThirdPartyTeleports: !!g.allowThirdPartyTeleports,
         maxPlayers: g.maxPlayers || 10,
-        serverCount: g.serverCount || 1,
         defaultRigType: g.defaultRigType || 'PlayerChoice'
     };
 }
@@ -300,15 +299,15 @@ function parseUploadOptionsFields(body) {
     const gearsAllowed = body.gearsAllowed === 'true';
     const allowCopying = body.allowCopying === 'true';
     const allowThirdPartyTeleports = body.allowThirdPartyTeleports === 'true';
-    // Clamp 1-50 same as the plugin's two sliders.
+    // Clamp 1-50, same as the plugin's slider. This is the cap PER SERVER
+    // INSTANCE - how many instances actually exist is no longer a fixed number
+    // the creator picks; see the INSTANCING section for how instances are
+    // created/destroyed on demand as players come and go.
     let maxPlayers = parseInt(body.maxPlayers, 10);
     if (!Number.isFinite(maxPlayers)) maxPlayers = 10;
     maxPlayers = Math.min(50, Math.max(1, maxPlayers));
-    let serverCount = parseInt(body.serverCount, 10);
-    if (!Number.isFinite(serverCount)) serverCount = 1;
-    serverCount = Math.min(50, Math.max(1, serverCount));
 
-    return { maturityRating, defaultRigType, genre, theme, gearsAllowed, allowCopying, allowThirdPartyTeleports, maxPlayers, serverCount };
+    return { maturityRating, defaultRigType, genre, theme, gearsAllowed, allowCopying, allowThirdPartyTeleports, maxPlayers };
 }
 
 
@@ -765,7 +764,7 @@ app.post('/games/:id/content', upload.single('file'), (req, res) => {
         // them showed up on this request.
         if (req.body.maturityRating !== undefined || req.body.defaultRigType !== undefined ||
             req.body.genre !== undefined || req.body.theme !== undefined ||
-            req.body.maxPlayers !== undefined || req.body.serverCount !== undefined) {
+            req.body.maxPlayers !== undefined) {
             Object.assign(g, parseUploadOptionsFields(req.body));
         }
 
@@ -2196,10 +2195,16 @@ const sitePresence = {}; // lowercased username -> { socketId, username, lastSee
 function findActiveGameForUsername(username) {
     const lower = (username || '').toString().toLowerCase();
     if (!lower) return null;
-    for (const gameId in gameStates) {
-        const room = gameStates[gameId];
-        for (const socketId in room) {
-            if ((room[socketId].name || '').toLowerCase() === lower) {
+    for (const room in gameStates) {
+        const players = gameStates[room];
+        for (const socketId in players) {
+            if ((players[socketId].name || '').toLowerCase() === lower) {
+                // Strip the "#N" instance suffix (if any) to get back the base
+                // gameId a friend's "Join Game" button should actually use -
+                // joinGame() will route them into a real (possibly different,
+                // if theirs has since filled up) instance of the same game.
+                const hashIdx = room.indexOf(INSTANCE_SEP);
+                const gameId = hashIdx === -1 ? room : room.slice(0, hashIdx);
                 const g = games.find(x => x.id === gameId);
                 return { gameId, gameName: g ? g.name : 'a game' };
             }
@@ -2335,6 +2340,87 @@ const io = new Server(server, {
 
 const gameStates = {};
 
+// ================= REAL SERVER INSTANCING =================
+// A published game can be played by more people than its Max Players setting
+// allows in one room, so instead of one room per gameId, each gameId now maps
+// to however many actual server instances are currently needed. Instances are
+// created on demand (the moment someone needs one and every existing instance
+// is full) and destroyed the moment they empty out - there's no fixed count to
+// configure anymore, matching real Roblox's "servers spin up/down with demand"
+// behavior instead of a creator-picked number of always-on placeholder rooms.
+//
+// Room naming: a real published game's socket.io room for instance N of gameId
+// "abc123" is "abc123#N" (gameStates key matches). Non-game rooms - Studio
+// collab sessions ("studio_<id>") and anything else that isn't a real games[]
+// entry - are exempt from instancing entirely and keep using the gameId as-is
+// for a single shared room, since those aren't public game listings with a
+// Max Players setting to enforce.
+const INSTANCE_SEP = '#';
+
+function isRealGameId(gameId) {
+    return games.some(g => g.id === gameId);
+}
+
+function maxPlayersForGame(gameId) {
+    const g = games.find(x => x.id === gameId);
+    return (g && g.maxPlayers) || 10;
+}
+
+// Every live instance room name for a base gameId, e.g. "abc123#1", "abc123#2".
+function instanceRoomsFor(gameId) {
+    const prefix = gameId + INSTANCE_SEP;
+    return Object.keys(gameStates).filter(room => room.startsWith(prefix));
+}
+
+// Finds an existing instance with room to spare, or creates the next-numbered
+// one if every existing instance is full (or none exist yet) - this is the
+// "just make a new server if one gets full" behavior, with no upper limit on
+// how many instances can exist.
+function findOrCreateInstance(gameId) {
+    const cap = maxPlayersForGame(gameId);
+    const rooms = instanceRoomsFor(gameId);
+    for (const room of rooms) {
+        if (Object.keys(gameStates[room]).length < cap) return room;
+    }
+    // Every instance is full (or there are none yet) - number the new one
+    // one higher than the current max instance number in use.
+    let maxN = 0;
+    rooms.forEach(room => {
+        const n = parseInt(room.slice(gameId.length + 1), 10);
+        if (Number.isFinite(n) && n > maxN) maxN = n;
+    });
+    const newRoom = gameId + INSTANCE_SEP + (maxN + 1);
+    gameStates[newRoom] = {};
+    return newRoom;
+}
+
+// A room is torn down the instant it empties, so instance numbers don't pile
+// up forever and a later /games/:id/instances call only ever lists rooms that
+// really have someone in them.
+function destroyRoomIfEmpty(room) {
+    if (gameStates[room] && Object.keys(gameStates[room]).length === 0) {
+        delete gameStates[room];
+    }
+}
+
+// GET /games/:id/instances - live instance list for the real "Join Server" UI
+// on the game page: one entry per currently-running instance, each with its
+// real current player count out of the game's real Max Players cap. An empty
+// array just means nobody's playing yet (the first joiner spins up instance 1).
+app.get('/games/:id/instances', (req, res) => {
+    const g = games.find(x => x.id === req.params.id);
+    if (!g) return res.status(404).json({ error: 'Game not found' });
+
+    const cap = g.maxPlayers || 10;
+    const instances = instanceRoomsFor(g.id).map(room => {
+        const n = parseInt(room.slice(g.id.length + 1), 10);
+        const count = Object.keys(gameStates[room]).length;
+        return { instance: n, players: count, maxPlayers: cap, full: count >= cap };
+    }).sort((a, b) => a.instance - b.instance);
+
+    res.json({ gameId: g.id, maxPlayers: cap, instances });
+});
+
 io.on('connection', (socket) => {
     // ---- Site presence: client emits this once on connect (and again after a ----
     // ---- reconnect) so friends can be shown "online" even outside a game.    ----
@@ -2345,7 +2431,14 @@ io.on('connection', (socket) => {
         sitePresence[username.toLowerCase()] = { socketId: socket.id, username, lastSeen: Date.now() };
     });
 
-    socket.on('joinGame', ({ gameId, userData }) => {
+    // `gameId` is the base game id (e.g. from game.serverId), same as before -
+    // callers don't need to know or pick an instance number. If the client
+    // wants a SPECIFIC instance (e.g. clicking "Join" on a particular server
+    // row, or following a friend into their exact instance), it can instead
+    // pass `instance` alongside `gameId` and we'll join that one directly
+    // (still subject to its cap - if it's full/gone this falls back to
+    // findOrCreateInstance same as a plain join).
+    socket.on('joinGame', ({ gameId, instance, userData }) => {
         const account = findAccountByUsername((userData && userData.username) || '');
         if (account && liftBanIfExpired(account)) saveAccountsIndex();
         if (account && account.banned) {
@@ -2365,13 +2458,28 @@ io.on('connection', (socket) => {
                 delete gameStates[room][socket.id];
                 socket.leave(room);
                 socket.to(room).emit('playerLeft', socket.id);
+                destroyRoomIfEmpty(room);
             }
         });
 
-        socket.join(gameId);
-        if (!gameStates[gameId]) gameStates[gameId] = {};
+        // Real published games get routed to a real instance room; anything
+        // else (Studio collab sessions, etc.) keeps the old single-room behavior.
+        let room = gameId;
+        if (isRealGameId(gameId)) {
+            const cap = maxPlayersForGame(gameId);
+            if (typeof instance === 'number' && gameStates[gameId + INSTANCE_SEP + instance] &&
+                Object.keys(gameStates[gameId + INSTANCE_SEP + instance]).length < cap) {
+                room = gameId + INSTANCE_SEP + instance;
+            } else {
+                room = findOrCreateInstance(gameId);
+            }
+        }
 
-        gameStates[gameId][socket.id] = {
+        socket.join(room);
+        socket.data.gameRoom = room;
+        if (!gameStates[room]) gameStates[room] = {};
+
+        gameStates[room][socket.id] = {
             id: socket.id,
             name: userData.username || "Guest",
             appearance: userData.appearance || {},
@@ -2381,8 +2489,12 @@ io.on('connection', (socket) => {
             health: 100
         };
 
-        socket.to(gameId).emit('playerJoined', gameStates[gameId][socket.id]);
-        socket.emit('currentPlayers', gameStates[gameId]);
+        socket.to(room).emit('playerJoined', gameStates[room][socket.id]);
+        // Tell the joiner which real room/instance it actually landed in, so a
+        // client that cares (e.g. to show "Server 2" in its own UI) can - this
+        // is new info the old flat-gameId flow never needed to send back.
+        socket.emit('currentPlayers', gameStates[room]);
+        socket.emit('joinedInstance', { gameId, room, instance: room.includes(INSTANCE_SEP) ? parseInt(room.slice(gameId.length + 1), 10) : null });
         updateGlobalCounts();
     });
 
@@ -2439,16 +2551,26 @@ socket.on('updateState', (data) => {
             if (gameStates[room] && gameStates[room][socket.id]) {
                 delete gameStates[room][socket.id];
                 socket.to(room).emit('playerLeft', socket.id);
+                destroyRoomIfEmpty(room);
             }
         });
         updateGlobalCounts();
     }
 });
 
+// Aggregates every live instance room back up to its base gameId (e.g.
+// "abc123#1" + "abc123#2" both count toward "abc123") so existing consumers
+// of 'playerCounts' - the game-card player counts on the Home/Discover pages -
+// keep working unchanged and show the TRUE total across every real instance,
+// not just one room's worth. studio_* and other non-instanced rooms report
+// under their own room name exactly as before.
 function updateGlobalCounts() {
     const counts = {};
-    for (const gameId in gameStates) {
-        counts[gameId] = Object.keys(gameStates[gameId]).length;
+    for (const room in gameStates) {
+        const hashIdx = room.indexOf(INSTANCE_SEP);
+        const baseId = hashIdx === -1 ? room : room.slice(0, hashIdx);
+        const key = hashIdx === -1 ? room : 'game_' + baseId;
+        counts[key] = (counts[key] || 0) + Object.keys(gameStates[room]).length;
     }
     io.emit('playerCounts', counts);
 }
