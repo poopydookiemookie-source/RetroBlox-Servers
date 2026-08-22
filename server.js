@@ -392,6 +392,7 @@ catalogItems.forEach(i => {
     if (i.modelData === undefined) i.modelData = null;
     if (i.originalPosition === undefined) i.originalPosition = null;
     if (i.originalSize === undefined) i.originalSize = null;
+    if (typeof i.forSale !== 'boolean') i.forSale = true;
 });
 
 function saveCatalogItemsIndex() {
@@ -502,7 +503,8 @@ function publicCatalogItem(i) {
         createdAt: i.createdAt,
         children: i.children || [],
         originalPosition: i.originalPosition || null,
-        originalSize: i.originalSize || null
+        originalSize: i.originalSize || null,
+        forSale: i.forSale !== false
     };
 }
 
@@ -693,6 +695,131 @@ app.get('/badges/:id/has/:username', (req, res) => {
 
     const hasBadge = Array.isArray(account.badges) && account.badges.some(a => String(a.badgeId) === String(badge.id));
     res.json({ hasBadge });
+});
+
+// ---- Award stats for one badge - total wins, plus how many were won today/yesterday ----
+// ---- (Creations -> Badges tab -> click a badge -> detail view). "Today"/"yesterday" ----
+// ---- are calendar days in server-local time, same as Date.now() everywhere else here. ----
+app.get('/badges/:id/stats', (req, res) => {
+    const badge = findBadgeById(req.params.id);
+    if (!badge) return res.status(404).json({ error: 'no-badge', message: 'Badge not found.' });
+
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const startOfYesterday = startOfToday - 24 * 60 * 60 * 1000;
+
+    let total = 0, wonToday = 0, wonYesterday = 0;
+    for (const account of accounts) {
+        if (!Array.isArray(account.badges)) continue;
+        for (const award of account.badges) {
+            if (String(award.badgeId) !== String(badge.id)) continue;
+            total++;
+            if (award.awardedAt >= startOfToday) wonToday++;
+            else if (award.awardedAt >= startOfYesterday) wonYesterday++;
+        }
+    }
+
+    res.json({ total, wonToday, wonYesterday });
+});
+
+// ---- Every badge a player has created, across all their games (Studio Creations -> ----
+// ---- Development Items -> Badges tab). Distinct from GET /accounts/:username/badges ----
+// ---- below, which lists badges that player has *earned*, not made. ----
+app.get('/accounts/:username/created-badges', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    const out = badges
+        .filter(b => b.creator.toLowerCase() === account.username.toLowerCase())
+        .map(b => publicBadge(b));
+
+    res.json({ badges: out });
+});
+
+// Same "only the creator may touch this" gate as requireCatalogItemOwner above, scoped
+// to a badge's `creator` field.
+function requireBadgeOwner(req, res, badge) {
+    const username = (req.body.username || req.query.username || '').toString().trim();
+    if (!username || username.toLowerCase() !== (badge.creator || '').toString().trim().toLowerCase()) {
+        res.status(403).json({ error: 'not-owner', message: 'Only this badge\'s creator can change it.' });
+        return false;
+    }
+    return true;
+}
+
+// ---- Rename a badge (Creations -> badge's "..." settings -> Rename) ----
+app.post('/badges/:id/rename', (req, res) => {
+    const badge = findBadgeById(req.params.id);
+    if (!badge) return res.status(404).json({ error: 'no-badge', message: 'Badge not found.' });
+    if (!requireBadgeOwner(req, res, badge)) return;
+
+    const name = (req.body.name || '').toString().trim();
+    if (!name) return res.status(400).json({ error: 'invalid-name', message: 'Name cannot be empty.' });
+    badge.name = name.slice(0, 60);
+
+    saveBadgesIndex();
+    res.json({ success: true, badge: publicBadge(badge) });
+});
+
+// ---- Edit a badge's description (Creations -> badge's "..." settings) ----
+app.post('/badges/:id/description', (req, res) => {
+    const badge = findBadgeById(req.params.id);
+    if (!badge) return res.status(404).json({ error: 'no-badge', message: 'Badge not found.' });
+    if (!requireBadgeOwner(req, res, badge)) return;
+
+    const description = (req.body.description || '').toString().trim();
+    if (!description) return res.status(400).json({ error: 'invalid-description', message: 'Description cannot be empty.' });
+    badge.description = description.slice(0, 1000);
+
+    saveBadgesIndex();
+    res.json({ success: true, badge: publicBadge(badge) });
+});
+
+// ---- Replace a badge's icon image (Creations -> badge's "..." settings -> Change Image) ----
+app.post('/badges/:id/image', badgeIconUpload.single('icon'), (req, res) => {
+    const badge = findBadgeById(req.params.id);
+    if (!badge) return res.status(404).json({ error: 'no-badge', message: 'Badge not found.' });
+    if (!requireBadgeOwner(req, res, badge)) return;
+
+    if (!req.file) return res.status(400).json({ error: 'no-image', message: 'An icon image (PNG or JPG) is required.' });
+    const mime = (req.file.mimetype || '').toLowerCase();
+    const ALLOWED_MIMES = ['image/png', 'image/jpeg', 'image/jpg'];
+    if (!ALLOWED_MIMES.includes(mime)) {
+        return res.status(400).json({ error: 'invalid-file-type', message: 'Badge icons must be a PNG or JPG file.' });
+    }
+
+    const imgExt = mime === 'image/png' ? '.png' : '.jpg';
+    const filename = `${badge.id}${imgExt}`;
+    fs.writeFileSync(path.join(BADGE_UPLOADS_DIR, filename), req.file.buffer);
+    badge.iconPath = `${PUBLIC_SERVER_URL}/badges/icon/${filename}`;
+
+    saveBadgesIndex();
+    res.json({ success: true, badge: publicBadge(badge) });
+});
+
+// ---- Permanently delete a badge (Creations -> badge's "..." settings -> Delete Forever) ----
+// Players who already earned this badge keep the awardedAt entry on their account, but
+// GET /accounts/:username/badges silently skips it (findBadgeById returns nothing), the
+// same way a removed catalog item would disappear from someone's inventory.
+app.delete('/badges/:id', (req, res) => {
+    const idx = badges.findIndex(b => String(b.id) === String(req.params.id));
+    if (idx === -1) return res.status(404).json({ error: 'no-badge', message: 'Badge not found.' });
+    const badge = badges[idx];
+    if (!requireBadgeOwner(req, res, badge)) return;
+
+    try {
+        if (badge.iconPath && badge.iconPath.includes('/badges/icon/')) {
+            const filename = badge.iconPath.split('/badges/icon/')[1];
+            const filePath = path.join(BADGE_UPLOADS_DIR, filename);
+            if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        }
+    } catch (err) {
+        console.error('Failed to remove badge icon on delete:', err);
+    }
+
+    badges.splice(idx, 1);
+    saveBadgesIndex();
+    res.json({ success: true });
 });
 
 // ---- Every badge a player has ever earned, newest first (profile page's Badges section) ----
@@ -1574,6 +1701,7 @@ app.post('/catalog/upload', catalogImageUpload.single('image'), (req, res) => {
             createdAt: Date.now(),
             takenDown: false,
             takedownReason: '',
+            forSale: true,
             children,
             originalPosition,
             originalSize
@@ -1586,6 +1714,123 @@ app.post('/catalog/upload', catalogImageUpload.single('image'), (req, res) => {
         console.error('Catalog upload error:', err);
         res.status(500).json({ error: 'upload-failed', message: 'Something went wrong uploading that item.' });
     }
+});
+
+// Same "only the creator may touch this" gate as requireOwner() for games above, just
+// scoped to a catalog item's `creator` field instead of a game's.
+function requireCatalogItemOwner(req, res, item) {
+    const username = (req.body.username || req.query.username || '').toString().trim();
+    if (!username || username.toLowerCase() !== (item.creator || '').toString().trim().toLowerCase()) {
+        res.status(403).json({ error: 'not-owner', message: 'Only this item\'s creator can change it.' });
+        return false;
+    }
+    return true;
+}
+
+// ---- List every catalog item a player has uploaded (Studio Creations -> Development Items) ----
+app.get('/accounts/:username/catalog-items', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    const items = catalogItems
+        .filter(i => i.creator.toLowerCase() === account.username.toLowerCase())
+        .map(publicCatalogItem);
+
+    res.json(items);
+});
+
+// ---- Rename a catalog item (Creations -> item's "..." settings -> Rename) ----
+app.post('/catalog/:id/rename', (req, res) => {
+    const item = findCatalogItemById(req.params.id);
+    if (!item) return res.status(404).json({ error: 'not-found', message: 'That catalog item does not exist.' });
+    if (!requireCatalogItemOwner(req, res, item)) return;
+
+    const name = (req.body.name || '').toString().trim();
+    if (!name) return res.status(400).json({ error: 'invalid-name', message: 'Name cannot be empty.' });
+    item.name = name.slice(0, 60);
+
+    saveCatalogItemsIndex();
+    res.json({ success: true, item: publicCatalogItem(item) });
+});
+
+// ---- Change a catalog item's price (Shirts/Pants/T-Shirts/Accessories only) ----
+app.post('/catalog/:id/price', (req, res) => {
+    const item = findCatalogItemById(req.params.id);
+    if (!item) return res.status(404).json({ error: 'not-found', message: 'That catalog item does not exist.' });
+    if (!requireCatalogItemOwner(req, res, item)) return;
+
+    const price = Math.round(Number(req.body.price));
+    if (!Number.isFinite(price) || price < MIN_ITEM_PRICE || price > MAX_ITEM_PRICE) {
+        return res.status(400).json({ error: 'invalid-price', message: `Price must be between ${MIN_ITEM_PRICE} and ${MAX_ITEM_PRICE}.` });
+    }
+    item.price = price;
+
+    saveCatalogItemsIndex();
+    res.json({ success: true, item: publicCatalogItem(item) });
+});
+
+// ---- Take a catalog item off sale / put it back on sale (Creations -> "..." settings) ----
+// Distinct from the admin-only `takenDown` moderation flag above - this is the
+// creator's own on/off switch (like real Roblox's "Off Sale"), and unlike takenDown it
+// doesn't hide the item from someone who already owns/equipped it, only from the
+// catalog listing/purchase flow.
+app.post('/catalog/:id/for-sale', (req, res) => {
+    const item = findCatalogItemById(req.params.id);
+    if (!item) return res.status(404).json({ error: 'not-found', message: 'That catalog item does not exist.' });
+    if (!requireCatalogItemOwner(req, res, item)) return;
+
+    item.forSale = !!req.body.forSale;
+
+    saveCatalogItemsIndex();
+    res.json({ success: true, item: { ...publicCatalogItem(item), forSale: item.forSale } });
+});
+
+// ---- Replace a catalog item's image (Shirts/Pants/T-Shirts/Faces only - accessories ----
+// ---- are 3D models, not images, so this route rejects those categories). ----
+app.post('/catalog/:id/image', catalogImageUpload.single('image'), (req, res) => {
+    const item = findCatalogItemById(req.params.id);
+    if (!item) return res.status(404).json({ error: 'not-found', message: 'That catalog item does not exist.' });
+    if (!requireCatalogItemOwner(req, res, item)) return;
+    if (ACCESSORY_CATEGORIES.includes(item.category)) {
+        return res.status(400).json({ error: 'not-an-image-item', message: 'Accessories are 3D models and can\'t have their image swapped here.' });
+    }
+
+    if (!req.file) return res.status(400).json({ error: 'no-image', message: 'An image (PNG or JPG) is required.' });
+    const mime = (req.file.mimetype || '').toLowerCase();
+    const ALLOWED_MIMES = ['image/png', 'image/jpeg', 'image/jpg'];
+    if (!ALLOWED_MIMES.includes(mime)) {
+        return res.status(400).json({ error: 'invalid-file-type', message: 'Catalog images must be a PNG or JPG file.' });
+    }
+
+    const imgExt = mime === 'image/png' ? '.png' : '.jpg';
+    const filename = `${item.id}${imgExt}`;
+    fs.writeFileSync(path.join(CATALOG_UPLOADS_DIR, filename), req.file.buffer);
+    item.itemPath = `${PUBLIC_SERVER_URL}/catalog/image/${filename}`;
+
+    saveCatalogItemsIndex();
+    res.json({ success: true, item: publicCatalogItem(item) });
+});
+
+// ---- Permanently delete a catalog item (Creations -> "..." settings -> Delete Forever) ----
+app.delete('/catalog/:id', (req, res) => {
+    const idx = catalogItems.findIndex(i => String(i.id) === String(req.params.id));
+    if (idx === -1) return res.status(404).json({ error: 'not-found', message: 'That catalog item does not exist.' });
+    const item = catalogItems[idx];
+    if (!requireCatalogItemOwner(req, res, item)) return;
+
+    try {
+        if (item.itemPath && item.itemPath.includes('/catalog/image/')) {
+            const filename = item.itemPath.split('/catalog/image/')[1];
+            const filePath = path.join(CATALOG_UPLOADS_DIR, filename);
+            if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        }
+    } catch (err) {
+        console.error('Failed to remove catalog item image on delete:', err);
+    }
+
+    catalogItems.splice(idx, 1);
+    saveCatalogItemsIndex();
+    res.json({ success: true });
 });
 
 // ================= TOOLBOX ASSETS =================
