@@ -37,6 +37,11 @@ if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 const CATALOG_UPLOADS_DIR = path.join(UPLOADS_DIR, 'catalog');
 if (!fs.existsSync(CATALOG_UPLOADS_DIR)) fs.mkdirSync(CATALOG_UPLOADS_DIR, { recursive: true });
 
+// Where uploaded badge icons (from Studio's Badge Creator plugin) get written. Same
+// ephemeral-disk caveat as UPLOADS_DIR above.
+const BADGE_UPLOADS_DIR = path.join(UPLOADS_DIR, 'badges');
+if (!fs.existsSync(BADGE_UPLOADS_DIR)) fs.mkdirSync(BADGE_UPLOADS_DIR, { recursive: true });
+
 console.log(`[storage] Using DATA_DIR: ${DATA_DIR}`);
 
 // Public base URL other machines use to reach THIS server. Catalog item images are
@@ -104,6 +109,10 @@ accounts.forEach(a => {
     if (!Array.isArray(a.followers)) a.followers = [];
     if (!Array.isArray(a.following)) a.following = [];
     if (!Array.isArray(a.blockedUsers)) a.blockedUsers = [];
+    // Every badge this account has ever been awarded, oldest first - {badgeId, awardedAt}.
+    // A badge can only ever appear once per account (AwardBadge is idempotent, matching
+    // real Roblox's BadgeService), so this array doubles as the "has earned" check.
+    if (!Array.isArray(a.badges)) a.badges = [];
     if (typeof a.bio !== 'string') a.bio = '';
     if (typeof a.avatarImage !== 'string') a.avatarImage = null;
     if (typeof a.robux !== 'number' || isNaN(a.robux)) a.robux = 0;
@@ -496,6 +505,214 @@ function publicCatalogItem(i) {
         originalSize: i.originalSize || null
     };
 }
+
+// ================= BADGES =================
+// A badge is created under one specific game (like real Roblox: you make it on the
+// site/Studio "under" an experience, then a server script awards it to players at
+// runtime). Persisted the same way catalog items are - a flat JSON file plus a
+// sequential ID counter - and icons are stored on disk the same way catalog item
+// images are (see BADGE_UPLOADS_DIR above).
+const BADGES_FILE = path.join(DATA_DIR, 'badges.json');
+const BADGE_ID_COUNTER_FILE = path.join(DATA_DIR, 'badge_id_counter.json');
+
+let badges = [];
+try {
+    badges = JSON.parse(fs.readFileSync(BADGES_FILE, 'utf8'));
+    console.log(`[storage] Loaded ${badges.length} badge(s) from ${BADGES_FILE}`);
+} catch (e) {
+    badges = [];
+    console.log(`[storage] No existing badges.json found at ${BADGES_FILE} (starting empty). Reason: ${e.code || e.message}`);
+}
+function saveBadgesIndex() {
+    try {
+        fs.writeFileSync(BADGES_FILE, JSON.stringify(badges, null, 2));
+    } catch (e) {
+        console.error('Failed to save badges index:', e);
+    }
+}
+
+let nextBadgeId = 1;
+try {
+    const counterData = JSON.parse(fs.readFileSync(BADGE_ID_COUNTER_FILE, 'utf8'));
+    if (typeof counterData.next === 'number' && counterData.next > 0) nextBadgeId = counterData.next;
+} catch (e) {
+    // No counter file yet - fine, we'll create one below.
+}
+function saveBadgeIdCounter() {
+    try {
+        fs.writeFileSync(BADGE_ID_COUNTER_FILE, JSON.stringify({ next: nextBadgeId }));
+    } catch (e) {
+        console.error('Failed to save badge ID counter:', e);
+    }
+}
+
+function findBadgeById(id) {
+    return badges.find(b => String(b.id) === String(id));
+}
+
+// Public-safe view of a badge, used by the game page's Badges card and anywhere else
+// a badge definition (not an award) is shown.
+function publicBadge(b) {
+    return {
+        id: b.id,
+        gameId: b.gameId,
+        name: b.name,
+        description: b.description,
+        iconPath: b.iconPath,
+        creator: b.creator,
+        createdAt: b.createdAt
+    };
+}
+
+// ---- Create a new badge under a specific game (Studio's Badge Creator plugin) ----
+// Only that game's creator can add badges to it - same ownership rule Retroblox
+// already enforces for editing/renaming/archiving a game elsewhere in this file.
+const badgeIconUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 5 * 1024 * 1024 }
+});
+
+app.post('/games/:id/badges', badgeIconUpload.single('icon'), (req, res) => {
+    try {
+        const game = games.find(g => g.id === req.params.id);
+        if (!game) return res.status(404).json({ error: 'no-game', message: 'Game not found.' });
+
+        const account = findAccountByUsername((req.body.username || '').toString());
+        if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found. Log in to create a badge.' });
+        if (liftBanIfExpired(account)) saveAccountsIndex();
+        if (account.banned) return res.status(403).json({ error: 'banned', message: 'Banned accounts cannot create badges.' });
+
+        if (account.username.toLowerCase() !== game.creator.toLowerCase()) {
+            return res.status(403).json({ error: 'not-owner', message: 'Only this game\'s creator can add badges to it.' });
+        }
+
+        const name = (req.body.name || '').toString().trim().slice(0, 60);
+        if (!name) return res.status(400).json({ error: 'missing-name', message: 'Give this badge a name.' });
+
+        const description = (req.body.description || '').toString().trim().slice(0, 1000);
+        if (!description) return res.status(400).json({ error: 'missing-description', message: 'A description is required to create a badge.' });
+
+        if (!req.file) return res.status(400).json({ error: 'no-image', message: 'An icon image (PNG or JPG) is required.' });
+        const mime = (req.file.mimetype || '').toLowerCase();
+        const ALLOWED_MIMES = ['image/png', 'image/jpeg', 'image/jpg'];
+        if (!ALLOWED_MIMES.includes(mime)) {
+            return res.status(400).json({ error: 'invalid-file-type', message: 'Badge icons must be a PNG or JPG file.' });
+        }
+
+        const id = nextBadgeId++;
+        saveBadgeIdCounter();
+
+        const imgExt = mime === 'image/png' ? '.png' : '.jpg';
+        const filename = `${id}${imgExt}`;
+        fs.writeFileSync(path.join(BADGE_UPLOADS_DIR, filename), req.file.buffer);
+        const iconPath = `${PUBLIC_SERVER_URL}/badges/icon/${filename}`;
+
+        const badge = {
+            id,
+            gameId: game.id,
+            name,
+            description,
+            iconPath,
+            creator: account.username,
+            createdAt: Date.now()
+        };
+        badges.push(badge);
+        saveBadgesIndex();
+
+        res.json({ success: true, badge: publicBadge(badge) });
+    } catch (err) {
+        console.error('Badge creation error:', err);
+        res.status(500).json({ error: 'creation-failed', message: 'Something went wrong creating that badge.' });
+    }
+});
+
+// Serve uploaded badge icon images (written by /games/:id/badges above).
+app.use('/badges/icon', express.static(BADGE_UPLOADS_DIR));
+
+// ---- List every badge that belongs to a specific game (game page's Badges card) ----
+// ?viewer=<username> additionally tags each badge with whether/when that viewer
+// earned it, so the game page can show "You won this today" etc.
+app.get('/games/:id/badges', (req, res) => {
+    const gameBadges = badges.filter(b => b.gameId === req.params.id);
+
+    const viewerUsername = (req.query.viewer || '').toString().trim();
+    const viewer = viewerUsername ? findAccountByUsername(viewerUsername) : null;
+
+    const out = gameBadges.map(b => {
+        const base = publicBadge(b);
+        if (viewer && Array.isArray(viewer.badges)) {
+            const award = viewer.badges.find(a => String(a.badgeId) === String(b.id));
+            base.awardedAt = award ? award.awardedAt : null;
+        } else {
+            base.awardedAt = null;
+        }
+        return base;
+    });
+
+    res.json({ badges: out });
+});
+
+// ---- Award a badge to a player (called from a game's server script via BadgeService:AwardBadge) ----
+// Idempotent like real Roblox - awarding a badge a player already has is a no-op success,
+// never a duplicate or an error. This is the only "write" badge endpoint; there is no
+// manual/admin award path, same as real Roblox (only a game's own server-side script can
+// award its badges).
+app.post('/badges/:id/award', (req, res) => {
+    try {
+        const badge = findBadgeById(req.params.id);
+        if (!badge) return res.status(404).json({ error: 'no-badge', message: 'Badge not found.' });
+
+        const username = (req.body.username || '').toString();
+        const account = findAccountByUsername(username);
+        if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+        if (!Array.isArray(account.badges)) account.badges = [];
+        const alreadyHas = account.badges.some(a => String(a.badgeId) === String(badge.id));
+        if (alreadyHas) {
+            return res.json({ success: true, alreadyAwarded: true, badge: publicBadge(badge) });
+        }
+
+        const awardedAt = Date.now();
+        account.badges.push({ badgeId: badge.id, awardedAt });
+        saveAccountsIndex();
+
+        res.json({ success: true, alreadyAwarded: false, awardedAt, badge: publicBadge(badge) });
+    } catch (err) {
+        console.error('Badge award error:', err);
+        res.status(500).json({ error: 'award-failed', message: 'Something went wrong awarding that badge.' });
+    }
+});
+
+// ---- Check whether a player already has a badge (BadgeService:UserHasBadgeAsync) ----
+app.get('/badges/:id/has/:username', (req, res) => {
+    const badge = findBadgeById(req.params.id);
+    if (!badge) return res.status(404).json({ error: 'no-badge', message: 'Badge not found.' });
+
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    const hasBadge = Array.isArray(account.badges) && account.badges.some(a => String(a.badgeId) === String(badge.id));
+    res.json({ hasBadge });
+});
+
+// ---- Every badge a player has ever earned, newest first (profile page's Badges section) ----
+app.get('/accounts/:username/badges', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    if (!Array.isArray(account.badges)) account.badges = [];
+    const out = account.badges
+        .slice()
+        .sort((a, b) => b.awardedAt - a.awardedAt)
+        .map(a => {
+            const badge = findBadgeById(a.badgeId);
+            if (!badge) return null; // badge definition was somehow removed - skip it
+            return { ...publicBadge(badge), awardedAt: a.awardedAt };
+        })
+        .filter(Boolean);
+
+    res.json({ badges: out });
+});
 
 // ================= STARTER PLACE =================
 // Every new account gets its own default game named "<username>'s Place", the same
