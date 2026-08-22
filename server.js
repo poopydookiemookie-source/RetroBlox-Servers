@@ -255,8 +255,21 @@ function publicGame(g) {
         icon: g.icon || null, // null means "use default image" on the client
         likes: g.likes,
         dislikes: g.dislikes,
-        createdAt: g.createdAt
+        createdAt: g.createdAt,
+        isPrivate: !!g.isPrivate,
+        archived: !!g.archived,
+        archivedAt: g.archivedAt || null
     };
+}
+
+// Whether `viewerUsername` is allowed to see/play a private game - true for the
+// game's own creator (case-insensitive, same comparison /games/:id/edit uses) or
+// an admin, false for anyone else (including guests, who pass no username at all).
+function canViewPrivateGame(g, viewerUsername) {
+    const viewer = (viewerUsername || '').toString().trim();
+    if (!viewer) return false;
+    if (viewer.toLowerCase() === (g.creator || '').toString().trim().toLowerCase()) return true;
+    return isAdminUsername(viewer);
 }
 
 // Public-safe view of an account for another user to see (friends list, friend
@@ -575,8 +588,15 @@ app.get('/debug/storage', (req, res) => {
 });
 
 // ---- List all games (used by the home page) ----
+// Private games only show up for their own creator (pass ?username=you), and
+// archived games never show up here at all - archived games only ever appear
+// under the owner's Studio "Archive" tab (see /accounts/:username/creations).
 app.get('/games', (req, res) => {
-    res.json(games.filter(g => !g.takenDown).map(publicGame));
+    const viewer = (req.query.username || '').toString();
+    res.json(games
+        .filter(g => !g.takenDown && !g.archived)
+        .filter(g => !g.isPrivate || canViewPrivateGame(g, viewer))
+        .map(publicGame));
 });
 
 // ---- Get a single game's metadata ----
@@ -585,6 +605,9 @@ app.get('/games/:id', (req, res) => {
     if (!g) return res.status(404).json({ error: 'Game not found' });
     if (g.takenDown && !isAdminUsername(req.query.adminUsername)) {
         return res.status(403).json({ error: 'taken-down', message: g.takedownReason || 'This game has been taken down by an administrator.' });
+    }
+    if (g.isPrivate && !canViewPrivateGame(g, req.query.username)) {
+        return res.status(403).json({ error: 'private', message: 'This game is private.' });
     }
     res.json(publicGame(g));
 });
@@ -595,6 +618,9 @@ app.get('/games/:id/content', (req, res) => {
     if (!g) return res.status(404).send('Game not found');
     if (g.takenDown && !isAdminUsername(req.query.adminUsername)) {
         return res.status(403).send(g.takedownReason || 'This game has been taken down by an administrator.');
+    }
+    if (g.isPrivate && !canViewPrivateGame(g, req.query.username)) {
+        return res.status(403).send('This game is private.');
     }
     const filePath = path.join(UPLOADS_DIR, g.filename);
     if (!fs.existsSync(filePath)) return res.status(404).send('Game file missing');
@@ -627,7 +653,10 @@ app.post('/upload', upload.single('file'), (req, res) => {
             dislikedBy: [],
             createdAt: Date.now(),
             takenDown: false,
-            takedownReason: ''
+            takedownReason: '',
+            isPrivate: false,
+            archived: false,
+            archivedAt: null
         };
 
         games.unshift(game);
@@ -695,6 +724,100 @@ app.post('/games/:id/content', upload.single('file'), (req, res) => {
         console.error('Save content error:', err);
         res.status(500).json({ error: 'Save failed', details: err.message });
     }
+});
+
+// Shared owner check for the settings actions below (rename/visibility/archive/
+// unarchive/permanent delete) - same case-insensitive creator match /games/:id/edit
+// already uses, kept in one place since five endpoints now need it.
+function requireOwner(req, res, g) {
+    const creator = (req.body.creator || '').toString().trim();
+    if (!creator || creator.toLowerCase() !== (g.creator || '').toString().trim().toLowerCase()) {
+        res.status(403).json({ error: 'not-owner', message: 'Only the creator can change this game.' });
+        return false;
+    }
+    return true;
+}
+
+// ---- Rename a game (Studio "My Games" -> "..." -> Rename) ----
+app.post('/games/:id/rename', (req, res) => {
+    const g = games.find(x => x.id === req.params.id);
+    if (!g) return res.status(404).json({ error: 'Game not found' });
+    if (!requireOwner(req, res, g)) return;
+
+    const name = (req.body.name || '').toString().trim();
+    if (!name) return res.status(400).json({ error: 'invalid-name', message: 'Name cannot be empty.' });
+    g.name = name.slice(0, 100);
+
+    saveGamesIndex();
+    res.json({ success: true, game: publicGame(g) });
+});
+
+// ---- Set a game's visibility (Studio "My Games" -> "..." -> Public/Private) ----
+// Private means only the creator (or an admin) can see or play it - enforced in
+// GET /games, /games/:id, and /games/:id/content above.
+app.post('/games/:id/visibility', (req, res) => {
+    const g = games.find(x => x.id === req.params.id);
+    if (!g) return res.status(404).json({ error: 'Game not found' });
+    if (!requireOwner(req, res, g)) return;
+
+    g.isPrivate = !!req.body.isPrivate;
+
+    saveGamesIndex();
+    res.json({ success: true, game: publicGame(g) });
+});
+
+// ---- Archive a game (Studio "My Games" -> "..." -> Archive) ----
+// Archived games drop out of My Games / the public /games list and appear only
+// under Archive. They're auto-deleted 7 days after archivedAt by the sweep below.
+app.post('/games/:id/archive', (req, res) => {
+    const g = games.find(x => x.id === req.params.id);
+    if (!g) return res.status(404).json({ error: 'Game not found' });
+    if (!requireOwner(req, res, g)) return;
+
+    g.archived = true;
+    g.archivedAt = Date.now();
+
+    saveGamesIndex();
+    res.json({ success: true, game: publicGame(g) });
+});
+
+// ---- Unarchive a game (Archive -> "(Archived) X's Settings" -> Unarchive) ----
+// Moves it back to My Games / the public listing (subject to its isPrivate flag).
+app.post('/games/:id/unarchive', (req, res) => {
+    const g = games.find(x => x.id === req.params.id);
+    if (!g) return res.status(404).json({ error: 'Game not found' });
+    if (!requireOwner(req, res, g)) return;
+
+    g.archived = false;
+    g.archivedAt = null;
+
+    saveGamesIndex();
+    res.json({ success: true, game: publicGame(g) });
+});
+
+// ---- Permanently delete an archived game (Archive -> "(Archived) X's Settings" ----
+// ---- -> Permanently Delete) - removes both the games.json entry and the .crbx ----
+// ---- file on disk. Only allowed while the game is archived, same as the 7-day ----
+// ---- auto-delete sweep below, so a game always has to pass through Archive first. ----
+app.delete('/games/:id', (req, res) => {
+    const idx = games.findIndex(x => x.id === req.params.id);
+    if (idx === -1) return res.status(404).json({ error: 'Game not found' });
+    const g = games[idx];
+    if (!requireOwner(req, res, g)) return;
+    if (!g.archived) {
+        return res.status(400).json({ error: 'not-archived', message: 'Only archived games can be permanently deleted.' });
+    }
+
+    try {
+        const filePath = path.join(UPLOADS_DIR, g.filename);
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    } catch (err) {
+        console.error('Failed to remove game file on delete:', err);
+    }
+
+    games.splice(idx, 1);
+    saveGamesIndex();
+    res.json({ success: true });
 });
 
 // A logged-in user's vote identity is their username (stable across devices/browsers).
@@ -1466,13 +1589,19 @@ app.get('/accounts/:username/profile', (req, res) => {
 });
 
 // ---- List every game a player has created/published (for the Creations section) ----
+// By default this returns only non-archived games (what Studio's "My Games" tab
+// shows) - pass ?archived=true to get the Archive tab's list instead. A game is
+// never in both lists at once (see the .archived filter below), matching "archived
+// games appear in the archive tab" / "unarchive... makes it go back into My Games".
 app.get('/accounts/:username/creations', (req, res) => {
     const account = findAccountByUsername(req.params.username);
     if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
 
     const showTakenDown = isAdminUsername(req.query.adminUsername);
+    const wantArchived = req.query.archived === 'true';
     const creations = games
         .filter(g => g.creator.toLowerCase() === account.username.toLowerCase() && (showTakenDown || !g.takenDown))
+        .filter(g => !!g.archived === wantArchived)
         .map(g => showTakenDown ? { ...publicGame(g), takenDown: !!g.takenDown, takedownReason: g.takedownReason || '' } : publicGame(g));
 
     res.json(creations);
@@ -2351,6 +2480,28 @@ setInterval(() => {
     let changed = false;
     accounts.forEach(a => { if (liftBanIfExpired(a)) changed = true; });
     if (changed) saveAccountsIndex();
+}, 60 * 1000);
+
+// Archive-expiry sweep: every minute, permanently delete any game that's been
+// archived for 7+ days - same "automatically" pattern as the ban-expiry sweep
+// above, so this doesn't depend on the owner ever reopening the Archive tab.
+const ARCHIVE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+setInterval(() => {
+    const cutoff = Date.now() - ARCHIVE_RETENTION_MS;
+    const expired = games.filter(g => g.archived && g.archivedAt && g.archivedAt <= cutoff);
+    if (expired.length === 0) return;
+
+    expired.forEach(g => {
+        try {
+            const filePath = path.join(UPLOADS_DIR, g.filename);
+            if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        } catch (err) {
+            console.error('Failed to remove expired archived game file:', err);
+        }
+    });
+    games = games.filter(g => !(g.archived && g.archivedAt && g.archivedAt <= cutoff));
+    saveGamesIndex();
+    console.log(`[archive-sweep] Permanently deleted ${expired.length} game(s) archived 7+ days ago.`);
 }, 60 * 1000);
 
 const PORT = process.env.PORT || 3000;
