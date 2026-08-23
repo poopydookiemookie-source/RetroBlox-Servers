@@ -288,8 +288,21 @@ function publicGame(g) {
         allowCopying: !!g.allowCopying,
         allowThirdPartyTeleports: !!g.allowThirdPartyTeleports,
         maxPlayers: g.maxPlayers || 10,
-        defaultRigType: g.defaultRigType || 'PlayerChoice'
+        defaultRigType: g.defaultRigType || 'PlayerChoice',
+        collaborators: Array.isArray(g.collaborators) ? g.collaborators : []
     };
+}
+
+// Whether `username` is allowed to open this game in Studio and build in it -
+// true for the owner (case-insensitive) or anyone on its collaborators list.
+// Used to gate the ?gameId= Studio load and the collab-session scene fetch;
+// NOT used for the ownership-only actions (edit/content save/rename/visibility/
+// archive/delete/invite) which stay creator-only via requireOwner/g.creator checks.
+function canEditGame(g, username) {
+    const u = (username || '').toString().trim().toLowerCase();
+    if (!u) return false;
+    if ((g.creator || '').toString().trim().toLowerCase() === u) return true;
+    return Array.isArray(g.collaborators) && g.collaborators.some(c => (c || '').toLowerCase() === u);
 }
 
 // Whether `viewerUsername` is allowed to see/play a private game - true for the
@@ -1120,6 +1133,12 @@ app.post('/upload', upload.single('file'), (req, res) => {
             isPrivate: false,
             archived: false,
             archivedAt: null,
+            // Studio collaborators: usernames the owner has granted "Shared With Me"
+            // access to (invite-only, friends-of-owner only - see POST /games/:id/invite).
+            // These accounts can open this game in Studio via ?gameId= and build in it,
+            // but every ownership-gated endpoint (edit/content/rename/visibility/archive/
+            // delete) still checks g.creator specifically, never this list.
+            collaborators: [],
             ...uploadOptions
         };
 
@@ -1290,6 +1309,80 @@ app.delete('/games/:id', (req, res) => {
     games.splice(idx, 1);
     saveGamesIndex();
     res.json({ success: true });
+});
+
+// ================= STUDIO COLLABORATORS ("Shared With Me") =================
+// Distinct from the ephemeral studioInvite socket ping (which just notifies someone
+// live that a session exists) - these endpoints are what actually grants a user
+// persistent access to open and build in someone else's game. Only the game's owner
+// can grant/revoke it, and only to accounts already on the owner's friends list.
+
+// ---- Owner invites a friend to collaborate on this game (grants Shared With Me access) ----
+app.post('/games/:id/invite', (req, res) => {
+    const g = games.find(x => x.id === req.params.id);
+    if (!g) return res.status(404).json({ error: 'Game not found' });
+    if (!requireOwner(req, res, g)) return;
+
+    const targetUsername = (req.body.username || '').toString().trim();
+    if (!targetUsername) return res.status(400).json({ error: 'missing-username', message: 'Missing username.' });
+    if (targetUsername.toLowerCase() === g.creator.toLowerCase()) {
+        return res.status(400).json({ error: 'cannot-invite-self', message: "You can't invite yourself." });
+    }
+
+    const targetAccount = findAccountByUsername(targetUsername);
+    if (!targetAccount) return res.status(404).json({ error: 'no-account', message: 'That user does not exist.' });
+
+    // Friends-only: only accounts the owner has actually friended can be invited -
+    // this is also what keeps "friends of friends" out, since it's always checked
+    // against the OWNER's own friends list, never the invitee's.
+    const ownerAccount = findAccountByUsername(g.creator);
+    const ownerFriends = (ownerAccount && Array.isArray(ownerAccount.friends)) ? ownerAccount.friends : [];
+    const isFriend = ownerFriends.some(f => f.toLowerCase() === targetAccount.username.toLowerCase());
+    if (!isFriend) {
+        return res.status(403).json({ error: 'not-friends', message: 'You can only invite friends to collaborate.' });
+    }
+
+    if (!Array.isArray(g.collaborators)) g.collaborators = [];
+    const already = g.collaborators.some(c => c.toLowerCase() === targetAccount.username.toLowerCase());
+    if (!already) {
+        g.collaborators.push(targetAccount.username);
+        saveGamesIndex();
+    }
+
+    res.json({ success: true, collaborators: g.collaborators, game: publicGame(g) });
+});
+
+// ---- Owner removes a collaborator's access ("take them away" from Shared With Me) ----
+// If that person is actively in a live collab session for this game right now, the
+// studio_* socket room for it gets a 'collabAccessRevoked' push so their client can
+// boot them out immediately (see io.on('connection') studio section below).
+app.post('/games/:id/collaborators/:username/remove', (req, res) => {
+    const g = games.find(x => x.id === req.params.id);
+    if (!g) return res.status(404).json({ error: 'Game not found' });
+    if (!requireOwner(req, res, g)) return;
+
+    const targetUsername = (req.params.username || '').toString().trim();
+    if (!Array.isArray(g.collaborators)) g.collaborators = [];
+    const before = g.collaborators.length;
+    g.collaborators = g.collaborators.filter(c => c.toLowerCase() !== targetUsername.toLowerCase());
+    if (g.collaborators.length !== before) saveGamesIndex();
+
+    // Kick any live session(s) tied to this game where the removed user is present.
+    revokeCollabAccess(g.id, targetUsername);
+
+    res.json({ success: true, collaborators: g.collaborators });
+});
+
+// ---- List every game shared with this account (their "Shared With Me" tab) ----
+app.get('/accounts/:username/shared-with-me', (req, res) => {
+    const username = (req.params.username || '').toString().trim().toLowerCase();
+    if (!username) return res.json([]);
+    const shared = games.filter(g =>
+        !g.archived &&
+        Array.isArray(g.collaborators) &&
+        g.collaborators.some(c => (c || '').toLowerCase() === username)
+    );
+    res.json(shared.map(publicGame));
 });
 
 // A logged-in user's vote identity is their username (stable across devices/browsers).
@@ -3135,11 +3228,42 @@ function updateGlobalCounts() {
 // plugin tab in Studio. Anyone invited who joins becomes part of studioRosters[sessionId].
 // Pressing Play broadcasts to the room so everyone enters play mode together, reusing the
 // exact same joinGame/updateState/etc events as the live game player (gameId = "studio_"+sessionId).
+//
+// Scene sync: the FIRST person to join a session is treated as the host (whoever's
+// editor already has the real place data loaded, i.e. the game's owner - the person
+// who owns the "Invite Friends" panel in the first place). When anyone else joins, we
+// ask the host for its current scene (studioSceneRequest -> host replies studioSceneData)
+// and relay that straight to the joiner, rather than the joiner starting from a blank
+// default scene. From then on, every edit either side makes is broadcast to the room
+// live via studioSceneEdit so both editors' 3D views stay in sync.
 const studioRosters = {}; // sessionId -> { [socketId]: { username } }
+const studioSessionGame = {}; // sessionId -> real gameId this session is editing (if any)
+const studioSessionHost = {}; // sessionId -> socketId of the current host (first joiner / owner)
+
+// Called by POST /games/:id/collaborators/:username/remove above - finds any live
+// studio session(s) editing this game where the removed user is present and boots
+// them out immediately, per the owner's expectation that removal is instant.
+function revokeCollabAccess(gameId, username) {
+    const u = (username || '').toLowerCase();
+    Object.keys(studioSessionGame).forEach(sessionId => {
+        if (studioSessionGame[sessionId] !== gameId) return;
+        const roster = studioRosters[sessionId];
+        if (!roster) return;
+        Object.keys(roster).forEach(socketId => {
+            if ((roster[socketId].username || '').toLowerCase() === u) {
+                io.to(socketId).emit('collabAccessRevoked', { gameId });
+            }
+        });
+    });
+}
 
 io.on('connection', (socket) => {
     // ---- Invite a friend to collaborate. Delivered live if they have the site open; ----
     // ---- otherwise this is a no-op (studio invites are ephemeral, not persisted DMs). ----
+    // NOTE: this only pushes the live chat-bubble notification - it does NOT grant access.
+    // Actually granting "Shared With Me" access happens via POST /games/:id/invite, which
+    // the client calls alongside this (see editor.html's invite() function) and which
+    // enforces owner-only + friends-only server-side regardless of what this event is sent.
     socket.on('studioInvite', ({ from, to, sessionId, placeName }) => {
         if (!from || !to || !sessionId) return;
         const recipientPresence = sitePresence[to.toLowerCase()];
@@ -3150,9 +3274,10 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('studioJoinSession', ({ sessionId, username }) => {
+    socket.on('studioJoinSession', ({ sessionId, username, gameId }) => {
         if (!sessionId || !username) return;
         const room = 'studio_' + sessionId;
+        const isFirstInRoom = !studioRosters[sessionId] || Object.keys(studioRosters[sessionId]).length === 0;
         socket.join(room);
         socket.data.studioSessionId = sessionId;
         socket.data.studioUsername = username;
@@ -3160,7 +3285,52 @@ io.on('connection', (socket) => {
         if (!studioRosters[sessionId]) studioRosters[sessionId] = {};
         studioRosters[sessionId][socket.id] = { username };
 
+        // Remember which real game this session belongs to (sent by whichever side
+        // actually has one open via ?gameId= - a from-scratch/unpublished place has
+        // none, which is fine, scene sync still works, there's just no revoke target).
+        if (gameId) studioSessionGame[sessionId] = gameId;
+
+        if (isFirstInRoom) {
+            studioSessionHost[sessionId] = socket.id;
+        } else {
+            // Ask whoever's currently hosting to hand this joiner its live scene. The
+            // host may have changed since studioSessionHost was first set (original
+            // host left) - fall back to just re-electing whoever's left if it's stale.
+            let hostId = studioSessionHost[sessionId];
+            if (!hostId || !studioRosters[sessionId][hostId]) {
+                hostId = Object.keys(studioRosters[sessionId]).find(id => id !== socket.id);
+                studioSessionHost[sessionId] = hostId;
+            }
+            if (hostId) io.to(hostId).emit('studioSceneRequest', { forSocketId: socket.id });
+        }
+
         io.to(room).emit('studioRoster', studioRosters[sessionId]);
+    });
+
+    // ---- Host relays its current place data to a specific newly-joined socket. ----
+    // Sent in response to studioSceneRequest above; routed point-to-point (not
+    // broadcast to the room) since only the requesting joiner needs it.
+    socket.on('studioSceneData', ({ forSocketId, data }) => {
+        if (!forSocketId || !data) return;
+        io.to(forSocketId).emit('studioSceneData', { data });
+    });
+
+    // ---- Live edit broadcast: any block add/move/delete/property change, or non-3D ----
+    // ---- item change, made while NOT in Play mode. Relayed to everyone else in the ----
+    // ---- session so both/all editors' scenes stay in sync in real time. ----
+    socket.on('studioSceneEdit', (edit) => {
+        const sessionId = socket.data && socket.data.studioSessionId;
+        if (!sessionId || !edit) return;
+        socket.to('studio_' + sessionId).emit('studioSceneEdit', edit);
+    });
+
+    // ---- Edit-mode presence ("flying heads"): where each collaborator's camera is ----
+    // ---- while building, separate from the Play-mode character position updates ----
+    // ---- (joinGame/updateState) which only apply once everyone's actually playing. ----
+    socket.on('studioEditPresence', (data) => {
+        const sessionId = socket.data && socket.data.studioSessionId;
+        if (!sessionId) return;
+        socket.to('studio_' + sessionId).emit('studioEditPresence', { id: socket.id, ...data });
     });
 
     socket.on('studioLeaveSession', () => {
@@ -3189,9 +3359,19 @@ io.on('connection', (socket) => {
         const room = 'studio_' + sessionId;
         if (studioRosters[sessionId]) {
             delete studioRosters[sessionId][socket.id];
+            // Tell everyone left in the room this socket's "flying head" should
+            // disappear, mirroring how playerLeft works for Play-mode characters.
+            socket.to(room).emit('studioEditPresenceLeft', { id: socket.id });
             if (Object.keys(studioRosters[sessionId]).length === 0) {
                 delete studioRosters[sessionId];
+                delete studioSessionGame[sessionId];
+                delete studioSessionHost[sessionId];
             } else {
+                if (studioSessionHost[sessionId] === socket.id) {
+                    // Host left - hand hosting to whoever's left so late joiners
+                    // still get a scene to sync from.
+                    studioSessionHost[sessionId] = Object.keys(studioRosters[sessionId])[0];
+                }
                 io.to(room).emit('studioRoster', studioRosters[sessionId]);
             }
         }
