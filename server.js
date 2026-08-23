@@ -113,6 +113,15 @@ accounts.forEach(a => {
     // A badge can only ever appear once per account (AwardBadge is idempotent, matching
     // real Roblox's BadgeService), so this array doubles as the "has earned" check.
     if (!Array.isArray(a.badges)) a.badges = [];
+    // Player Points (PointsService:AwardPoints), scoped per game the same way badges are
+    // scoped per game - {gameId, amount}. Unlike badges this ISN'T idempotent: real Roblox
+    // Player Points are a running balance a game can award to (negative amount deducts, per
+    // real Roblox), so each gameId entry just accumulates. account.pointsTotal is kept as a
+    // denormalized sum across every gameId entry so profile/GetPointBalance reads don't have
+    // to re-sum the array every time - see awardPointsToAccount() below, the only place either
+    // is ever written.
+    if (!Array.isArray(a.pointsByGame)) a.pointsByGame = [];
+    if (typeof a.pointsTotal !== 'number' || isNaN(a.pointsTotal)) a.pointsTotal = 0;
     if (typeof a.bio !== 'string') a.bio = '';
     if (typeof a.avatarImage !== 'string') a.avatarImage = null;
     if (typeof a.robux !== 'number' || isNaN(a.robux)) a.robux = 0;
@@ -654,6 +663,27 @@ app.get('/games/:id/badges', (req, res) => {
     res.json({ badges: out });
 });
 
+// ---- Player Points (PointsService) ----
+// Unlike badges, points have no registration step on real Roblox - a game just calls
+// AwardPoints(userId, amount) with a raw number, there's no "create a point type" concept.
+// So there's no findPointsById/publicPoints pair here, just this one mutator shared by the
+// award endpoint below and used by the balance-reading endpoints further down.
+//
+// amount can be negative (real Roblox: "Negative amounts will deduct their player points"),
+// but the running total is clamped at 0 - real Roblox doesn't document balances going negative,
+// and nothing in this codebase should show a player owing points.
+function awardPointsToAccount(account, gameId, amount) {
+    if (!Array.isArray(account.pointsByGame)) account.pointsByGame = [];
+    let entry = account.pointsByGame.find(p => p.gameId === gameId);
+    if (!entry) {
+        entry = { gameId, amount: 0 };
+        account.pointsByGame.push(entry);
+    }
+    entry.amount = Math.max(0, entry.amount + amount);
+    account.pointsTotal = Math.max(0, account.pointsByGame.reduce((sum, p) => sum + p.amount, 0));
+    return entry.amount;
+}
+
 // ---- Award a badge to a player (called from a game's server script via BadgeService:AwardBadge) ----
 // Idempotent like real Roblox - awarding a badge a player already has is a no-op success,
 // never a duplicate or an error. This is the only "write" badge endpoint; there is no
@@ -720,6 +750,54 @@ app.get('/badges/:id/stats', (req, res) => {
     }
 
     res.json({ total, wonToday, wonYesterday });
+});
+
+// ---- Award Player Points to a player (called from a game's server script via ----
+// ---- PointsService:AwardPoints(userId, amount)). Not idempotent like badge awards - ----
+// ---- every call adds amount onto that gameId's running balance (real Roblox: negative ----
+// ---- amounts deduct). There's no badge-style "definition" to look up first, since real ----
+// ---- Roblox points have no registration step - just a gameId and a number. ----
+app.post('/points/:gameId/award', (req, res) => {
+    try {
+        const gameId = req.params.gameId;
+        if (!isRealGameId(gameId)) return res.status(404).json({ error: 'no-game', message: 'Game not found.' });
+
+        const username = (req.body.username || '').toString();
+        const account = findAccountByUsername(username);
+        if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+        const amount = Number(req.body.amount);
+        if (!isFinite(amount) || amount === 0) {
+            return res.status(400).json({ error: 'invalid-amount', message: 'amount must be a non-zero number.' });
+        }
+
+        const userBalanceInGame = awardPointsToAccount(account, gameId, amount);
+        saveAccountsIndex();
+
+        res.json({ success: true, userBalanceInGame, userTotalBalance: account.pointsTotal });
+    } catch (err) {
+        console.error('Points award error:', err);
+        res.status(500).json({ error: 'award-failed', message: 'Something went wrong awarding those points.' });
+    }
+});
+
+// ---- PointsService:GetGamePointBalance(userId) - total points this player has earned ----
+// ---- in one specific game. ----
+app.get('/points/:gameId/balance/:username', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    const entry = Array.isArray(account.pointsByGame) ? account.pointsByGame.find(p => p.gameId === req.params.gameId) : null;
+    res.json({ balance: entry ? entry.amount : 0 });
+});
+
+// ---- PointsService:GetPointBalance(userId) - total points this player has earned across ----
+// ---- every game, also what's shown on their public profile. ----
+app.get('/accounts/:username/points', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    res.json({ balance: account.pointsTotal || 0 });
 });
 
 // ---- Every badge a player has created, across all their games (Studio Creations -> ----
@@ -2110,6 +2188,7 @@ app.get('/accounts/:username/profile', (req, res) => {
         friendsCount: account.friends.length,
         followersCount: account.followers.length,
         followingCount: account.following.length,
+        pointsTotal: account.pointsTotal || 0,
         relationship
     });
 });
