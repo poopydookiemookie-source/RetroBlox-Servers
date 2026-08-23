@@ -97,6 +97,18 @@ function publicAppearance(account) {
     return out;
 }
 
+// Real Roblox's old paid-subscription tiers - Enum.MembershipType member names, in
+// ascending order. Every account defaults to 'None' (see the accounts.forEach backfill
+// below); an admin can grant a tier from the Admin Players tab. TIER_ICON_FILES maps
+// each paid tier to the texture the client shows next to a player's name (None shows
+// no icon, matching real Roblox) - filenames match what's in content/textures/.
+const MEMBERSHIP_TYPES = ['None', 'BuildersClub', 'TurboBuildersClub', 'OutrageousBuildersClub'];
+const TIER_ICON_FILES = {
+    BuildersClub: 'buildersclub.png',
+    TurboBuildersClub: 'turbobuildersclub.png',
+    OutrageousBuildersClub: 'outrageousbuildersclub.png'
+};
+
 // Backfill fields for accounts created before friends/favorites/last-played/likes existed
 accounts.forEach(a => {
     if (!Array.isArray(a.friends)) a.friends = [];
@@ -129,6 +141,13 @@ accounts.forEach(a => {
     if (typeof a.banned !== 'boolean') a.banned = false;
     if (typeof a.banReason !== 'string') a.banReason = '';
     if (typeof a.banExpiresAt !== 'number') a.banExpiresAt = null;
+    // MembershipType: real Roblox's old paid-subscription tiers (BC/TBC/OBC) - this
+    // engine has no real payment backend, so every account defaults to None; an admin
+    // can grant a tier per-account from the Admin Players tab (see
+    // POST /admin/players/:username/membership below). Stored as the plain Enum member
+    // name string so it serializes simply over JSON - the Lua bridge (editor.html) maps
+    // this string onto the real Enum.MembershipType.* object PlayerlistModule/Topbar read.
+    if (typeof a.membershipType !== 'string' || !MEMBERSHIP_TYPES.includes(a.membershipType)) a.membershipType = 'None';
     if (typeof a.lastDailyRewardAt !== 'number') a.lastDailyRewardAt = 0;
     if (!a.appearance || typeof a.appearance !== 'object') a.appearance = {};
     // Migrate the old single "equippedAccessory" slot (pre-dates the 7-category
@@ -355,6 +374,7 @@ function publicAccount(a) {
         banned: !!a.banned,
         banReason: a.banReason || '',
         banExpiresAt: a.banExpiresAt || null,
+        membershipType: a.membershipType || 'None',
         friendsCount: Array.isArray(a.friends) ? a.friends.length : 0
     };
 }
@@ -1654,6 +1674,7 @@ app.get('/accounts/:username', (req, res) => {
         banned: !!account.banned,
         banReason: account.banReason || '',
         banExpiresAt: account.banExpiresAt || null,
+        membershipType: account.membershipType || 'None',
         dailyBonusGranted
     });
 });
@@ -2282,6 +2303,7 @@ app.get('/accounts/:username/profile', (req, res) => {
         followersCount: account.followers.length,
         followingCount: account.following.length,
         pointsTotal: account.pointsTotal || 0,
+        membershipType: account.membershipType || 'None',
         relationship
     });
 });
@@ -2852,6 +2874,25 @@ app.post('/admin/players/:username/grant', (req, res) => {
     const tixDelta = Number(req.body.tix) || 0;
     account.robux = Math.max(0, (account.robux || 0) + robuxDelta);
     account.tix = Math.max(0, (account.tix || 0) + tixDelta);
+    saveAccountsIndex();
+    res.json({ success: true, account: publicAccount(account) });
+});
+
+// ---- Set a player's MembershipType (None/BuildersClub/TurboBuildersClub/ ----
+// ---- OutrageousBuildersClub) - shows their tier icon next to their name in-game ----
+// ---- (Topbar/profile) and drives PlayerlistModule's real membershipType branch. ----
+// ---- Admins can set this on any account, including their own. ----
+app.post('/admin/players/:username/membership', (req, res) => {
+    if (!requireAdmin(req, res)) return;
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+
+    const membershipType = (req.body.membershipType || '').toString();
+    if (!MEMBERSHIP_TYPES.includes(membershipType)) {
+        return res.status(400).json({ error: 'invalid-membership-type', message: `membershipType must be one of: ${MEMBERSHIP_TYPES.join(', ')}` });
+    }
+
+    account.membershipType = membershipType;
     saveAccountsIndex();
     res.json({ success: true, account: publicAccount(account) });
 });
