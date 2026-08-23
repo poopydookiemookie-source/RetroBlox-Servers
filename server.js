@@ -2332,7 +2332,13 @@ app.post('/accounts/:username/follow', (req, res) => {
     if (!Array.isArray(target.followers)) target.followers = [];
     if (!Array.isArray(follower.following)) follower.following = [];
 
-    if (!target.followers.some(u => u.toLowerCase() === follower.username.toLowerCase())) {
+    // Only a genuinely NEW follow (not a repeat call on someone already followed)
+    // counts as "new" for the purposes of notifying the target live - matches
+    // BadgeService.AwardBadge/friendRequestReceived's own already-have guards just
+    // below/above this endpoint.
+    const isNewFollow = !target.followers.some(u => u.toLowerCase() === follower.username.toLowerCase());
+
+    if (isNewFollow) {
         target.followers.push(follower.username);
     }
     if (!follower.following.some(u => u.toLowerCase() === target.username.toLowerCase())) {
@@ -2340,6 +2346,25 @@ app.post('/accounts/:username/follow', (req, res) => {
     }
 
     saveAccountsIndex();
+
+    // Push the new-follower toast live if the target currently has the site/game
+    // open - same sitePresence lookup + io.to(socketId).emit(...) shape as
+    // friendRequestReceived/friendRequestAccepted above. NotificationScript2.lua's
+    // RobloxReplicatedStorage:WaitForChild('NewFollower').OnClientEvent listens for
+    // exactly this event (relayed into Lua by editor.html's socket handling), and
+    // expects a Player-shaped table with Name/userId - not just a bare username.
+    if (isNewFollow) {
+        const targetPresence = sitePresence[target.username.toLowerCase()];
+        if (targetPresence) {
+            io.to(targetPresence.socketId).emit('newFollower', {
+                username: follower.username,
+                userId: follower.playerId,
+                avatarImage: follower.avatarImage || null,
+                at: Date.now()
+            });
+        }
+    }
+
     res.json({ success: true, followersCount: target.followers.length });
 });
 
