@@ -2617,6 +2617,18 @@ app.post('/accounts/:username/friends/remove', (req, res) => {
     }
 
     saveAccountsIndex();
+
+    // ---- Live-notify the OTHER side if they're connected, same sitePresence lookup +
+    // ---- io.to(socketId).emit(...) shape as friendRequestAccepted/newFollower above -
+    // ---- this is what lets a running game's Player.FriendStatusChanged actually fire
+    // ---- for the unfriended party too, not just whoever clicked "Unfriend".
+    if (friendAccount) {
+        const otherPresence = sitePresence[friendAccount.username.toLowerCase()];
+        if (otherPresence) {
+            io.to(otherPresence.socketId).emit('friendRemoved', { by: account.username, at: Date.now() });
+        }
+    }
+
     res.json({ success: true, friends: account.friends });
 });
 
