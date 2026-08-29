@@ -76,6 +76,59 @@ function saveGamesIndex() {
     }
 }
 
+// ================= GAME ID COUNTER =================
+// Real Roblox place ids are short sequential integers (e.g. 606849621), not UUIDs -
+// this gives Retroblox the same feel: game #1, #2, #3... instead of
+// f72f7908-2c8b-49b5-98a5-f03285ca47e7. The counter is persisted to its own file
+// (survives restarts the same way games.json does) so ids never reuse or collide,
+// even across a restart or a redeploy.
+const GAME_ID_COUNTER_FILE = path.join(DATA_DIR, 'game-id-counter.json');
+let nextGameIdCounter = 1;
+try {
+    const saved = JSON.parse(fs.readFileSync(GAME_ID_COUNTER_FILE, 'utf8'));
+    if (typeof saved.next === 'number' && !isNaN(saved.next)) nextGameIdCounter = saved.next;
+} catch (e) {
+    // No counter file yet - fine, defaults to 1 below, then gets bumped past
+    // whatever's already in games.json by the backfill pass right after this.
+}
+
+function saveGameIdCounter() {
+    try {
+        fs.writeFileSync(GAME_ID_COUNTER_FILE, JSON.stringify({ next: nextGameIdCounter }));
+    } catch (e) {
+        console.error('Failed to save game id counter:', e);
+    }
+}
+
+// Hands out the next sequential game id as a STRING (every id comparison elsewhere
+// in this file is g.id === req.params.id, and Express route params are always
+// strings, so keeping ids as strings from the start avoids a "123" !== 123 bug).
+function nextGameId() {
+    const id = String(nextGameIdCounter);
+    nextGameIdCounter++;
+    saveGameIdCounter();
+    return id;
+}
+
+// One-time backfill: any game already in games.json from before this change has a
+// UUID id (and a matching UUID .crbx filename on disk) - give those clean sequential
+// ids too, so old games get nice URLs as well instead of being stuck forever. The
+// on-disk filename is left alone (renaming would mean re-writing the file), only the
+// public-facing id changes; filename is already tracked separately per-game so
+// nothing else needs to know they now differ.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+let didBackfillGameIds = false;
+games.forEach(g => {
+    if (typeof g.id === 'string' && UUID_RE.test(g.id)) {
+        g.id = nextGameId();
+        didBackfillGameIds = true;
+    }
+});
+if (didBackfillGameIds) {
+    saveGamesIndex();
+    console.log(`[storage] Backfilled sequential ids onto pre-existing UUID-id games.`);
+}
+
 // ================= ACCOUNT STORAGE SETUP =================
 const ACCOUNTS_INDEX_FILE = path.join(DATA_DIR, 'accounts.json');
 
@@ -1021,8 +1074,8 @@ function buildStarterPlaceContent(username) {
 
 function createStarterPlace(username, now) {
     try {
-        const id = crypto.randomUUID();
-        const filename = `${id}.crbx`;
+        const id = nextGameId();
+        const filename = `${crypto.randomUUID()}.crbx`; // on-disk filename stays a UUID - only the public id is sequential now
         fs.writeFileSync(path.join(UPLOADS_DIR, filename), buildStarterPlaceContent(username));
 
         const game = {
@@ -1134,8 +1187,8 @@ app.post('/upload', upload.single('file'), (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
-        const id = crypto.randomUUID();
-        const filename = `${id}.crbx`;
+        const id = nextGameId();
+        const filename = `${crypto.randomUUID()}.crbx`; // on-disk filename stays a UUID - only the public id is sequential now
         fs.writeFileSync(path.join(UPLOADS_DIR, filename), req.file.buffer);
 
         const icon = (typeof req.body.icon === 'string' && req.body.icon.startsWith('data:'))
