@@ -50,6 +50,12 @@ if (!fs.existsSync(SOUND_UPLOADS_DIR)) fs.mkdirSync(SOUND_UPLOADS_DIR, { recursi
 const DECAL_UPLOADS_DIR = path.join(UPLOADS_DIR, 'decals');
 if (!fs.existsSync(DECAL_UPLOADS_DIR)) fs.mkdirSync(DECAL_UPLOADS_DIR, { recursive: true });
 
+// Where uploaded Animation (.rbxmx KeyframeSequence, exported by the Keyframe Editor's
+// "Export .rbxmx (Uploadable)" button) assets get written, from Retroblox Studio's
+// Creations window ("Animations" tab). Same ephemeral-disk caveat as UPLOADS_DIR above.
+const ANIMATION_UPLOADS_DIR = path.join(UPLOADS_DIR, 'animations');
+if (!fs.existsSync(ANIMATION_UPLOADS_DIR)) fs.mkdirSync(ANIMATION_UPLOADS_DIR, { recursive: true });
+
 console.log(`[storage] Using DATA_DIR: ${DATA_DIR}`);
 
 // Public base URL other machines use to reach THIS server. Catalog item images are
@@ -2441,12 +2447,35 @@ app.get('/assets/:id/resolve', (req, res) => {
     let asset = findSoundById(id);
     let kind = 'sound';
     if (!asset) { asset = findDecalById(id); kind = 'decal'; }
+    if (!asset) { asset = findAnimationById(id); kind = 'animation'; }
     if (!asset || asset.deleted) return res.status(404).json({ error: 'not-found', message: 'That asset does not exist.' });
 
     if (asset.visibility === 'private') {
         const game = gameId ? games.find(g => g.id === gameId) : null;
         const owns = game && game.creator && game.creator.toLowerCase() === (asset.creator || '').toLowerCase();
         if (!owns) return res.status(404).json({ error: 'not-found', message: 'That asset does not exist.' });
+    }
+
+    if (kind === 'animation') {
+        // Unlike sound/decal (a playable/viewable media URL is enough), the Keyframe
+        // Editor needs the actual .rbxmx XML text to parse into a track - so this
+        // reads the file and inlines it as `content` alongside the usual fields,
+        // rather than making the caller do a second round-trip to assetUrl.
+        let content = null;
+        try {
+            content = fs.readFileSync(path.join(ANIMATION_UPLOADS_DIR, asset.filename), 'utf8');
+        } catch (err) {
+            console.error('Failed to read animation file for resolve:', err);
+            return res.status(500).json({ error: 'read-failed', message: 'Could not read that animation\'s data.' });
+        }
+        return res.json({
+            success: true,
+            kind,
+            id: asset.id,
+            name: asset.name,
+            assetUrl: `${PUBLIC_SERVER_URL}/animations/file/${asset.filename}`,
+            content
+        });
     }
 
     res.json({
@@ -2456,6 +2485,178 @@ app.get('/assets/:id/resolve', (req, res) => {
         name: asset.name,
         assetUrl: kind === 'sound' ? `${PUBLIC_SERVER_URL}/sounds/file/${asset.filename}` : `${PUBLIC_SERVER_URL}/decals/file/${asset.filename}`
     });
+});
+
+// ================= ANIMATIONS =================
+// .rbxmx KeyframeSequence assets uploaded from Retroblox Studio's Creations window
+// (Development Items -> Animations -> Upload). These are ONLY produced by the Keyframe
+// Editor's "Export .rbxmx (Uploadable)" button in editor.html - that export is the one
+// and only source of files this endpoint accepts, same as a real Roblox Animation is
+// authored in the Animation Editor and then published from there. Uploading itself only
+// happens here in Studio, never from editor.html directly - mirrors the Sounds/Decals
+// split above (export/author in one place, publish in another) and keeps one single
+// upload surface + review point.
+//
+// Referenced in-editor as cbxassetid://<id>, same scheme as Sounds/Decals (shares the
+// SAME id counter as those - see nextAssetId below), from the Animation instance's new
+// "Retroblox ID" property row (RetrobloxAnimationId) and from the Keyframe Editor's
+// "RetroBlox Animations" fetch-and-play box.
+//
+// Visibility works exactly like Sounds/Decals: "public" = anyone/any game can load it,
+// "private" = only games owned by the SAME account that uploaded it (enforced in
+// /assets/:id/resolve below, extended to also check the animations list).
+const ANIMATIONS_FILE = path.join(DATA_DIR, 'animations.json');
+const ANIMATION_MAX_BYTES = 5 * 1024 * 1024; // 5MB - plain XML KeyframeSequence text, always small
+
+let animations = [];
+try {
+    animations = JSON.parse(fs.readFileSync(ANIMATIONS_FILE, 'utf8'));
+    console.log(`[storage] Loaded ${animations.length} animation(s) from ${ANIMATIONS_FILE}`);
+} catch (e) {
+    animations = [];
+    console.log(`[storage] No existing animations.json found at ${ANIMATIONS_FILE} (starting empty). Reason: ${e.code || e.message}`);
+}
+animations.forEach(a => { if (a.visibility !== 'private') a.visibility = 'public'; });
+function saveAnimationsIndex() {
+    try {
+        fs.writeFileSync(ANIMATIONS_FILE, JSON.stringify(animations, null, 2));
+    } catch (e) {
+        console.error('Failed to save animations index:', e);
+    }
+}
+
+function findAnimationById(id) { return animations.find(a => String(a.id) === String(id)); }
+
+// Public-safe view - never includes the raw file path, just the id/name/owner/visibility.
+// assetUrl points at the raw .rbxmx XML file itself (there's nothing to "play" as a
+// static media URL the way a sound/decal has - the Keyframe Editor fetches and parses
+// this text directly), kept alongside cbxassetid for parity with publicSound/publicDecal.
+function publicAnimation(a) {
+    return {
+        id: a.id,
+        name: a.name,
+        assetUrl: `${PUBLIC_SERVER_URL}/animations/file/${a.filename}`,
+        cbxassetid: `cbxassetid://${a.id}`,
+        creator: a.creator,
+        visibility: a.visibility,
+        createdAt: a.createdAt
+    };
+}
+
+const animationUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: ANIMATION_MAX_BYTES }
+});
+
+// Serve uploaded animation files as plain static files (mainly for direct debugging -
+// normal playback goes through /assets/:id/resolve below, which returns the XML inline).
+app.use('/animations/file', express.static(ANIMATION_UPLOADS_DIR));
+
+// ---- Upload a new Animation (Studio Creations -> Animations -> Upload) ----
+// Accepts only .rbxmx (plain XML KeyframeSequence) - the exact format the Keyframe
+// Editor's Export button produces. Free, like Sounds/Decals/Toolbox assets.
+app.post('/animations/upload', (req, res) => {
+    animationUpload.single('file')(req, res, (err) => {
+        if (err) {
+            if (err.code === 'LIMIT_FILE_SIZE') {
+                return res.status(400).json({ error: 'file-too-large', message: 'Animations can\'t be over 5MB.' });
+            }
+            console.error('Animation upload error:', err);
+            return res.status(500).json({ error: 'upload-failed', message: 'Something went wrong uploading that animation.' });
+        }
+        try {
+            const account = findAccountByUsername((req.body.username || '').toString());
+            if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found. Log in to upload animations.' });
+            if (liftBanIfExpired(account)) saveAccountsIndex();
+            if (account.banned) return res.status(403).json({ error: 'banned', message: 'Banned accounts cannot upload animations.' });
+
+            const name = (req.body.name || '').toString().trim().slice(0, 60) || 'Untitled Animation';
+
+            if (!req.file) return res.status(400).json({ error: 'no-file', message: 'A .rbxmx file is required.' });
+            const originalName = (req.file.originalname || '').toLowerCase();
+            const looksLikeRbxmx = originalName.endsWith('.rbxmx') || originalName.endsWith('.xml');
+            const text = req.file.buffer.toString('utf8');
+            const looksLikeKeyframeSequence = text.includes('KeyframeSequence');
+            if (!looksLikeRbxmx || !looksLikeKeyframeSequence) {
+                return res.status(400).json({ error: 'invalid-file-type', message: 'Animations must be a .rbxmx KeyframeSequence file exported from the Keyframe Editor.' });
+            }
+
+            const visibility = (req.body.visibility || '').toString().toLowerCase().trim() === 'private' ? 'private' : 'public';
+
+            const id = nextAssetId++;
+            saveAssetIdCounter();
+
+            const filename = `${id}.rbxmx`;
+            fs.writeFileSync(path.join(ANIMATION_UPLOADS_DIR, filename), req.file.buffer);
+
+            const animation = {
+                id, name, filename,
+                creator: account.username,
+                visibility,
+                createdAt: Date.now(),
+                deleted: false
+            };
+            animations.push(animation);
+            saveAnimationsIndex();
+
+            res.json({ success: true, animation: publicAnimation(animation) });
+        } catch (err2) {
+            console.error('Animation upload error:', err2);
+            res.status(500).json({ error: 'upload-failed', message: 'Something went wrong uploading that animation.' });
+        }
+    });
+});
+
+// ---- List every animation a player has uploaded (Studio Creations -> Animations) ----
+app.get('/accounts/:username/animations', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+    const list = animations
+        .filter(a => !a.deleted && a.creator.toLowerCase() === account.username.toLowerCase())
+        .map(publicAnimation);
+    res.json({ animations: list });
+});
+
+// ---- Rename an animation ----
+app.post('/animations/:id/rename', (req, res) => {
+    const animation = findAnimationById(req.params.id);
+    if (!animation || animation.deleted) return res.status(404).json({ error: 'not-found', message: 'That animation does not exist.' });
+    if (!requireAssetOwner(req, res, animation)) return;
+    const name = (req.body.name || '').toString().trim();
+    if (!name) return res.status(400).json({ error: 'invalid-name', message: 'Name cannot be empty.' });
+    animation.name = name.slice(0, 60);
+    saveAnimationsIndex();
+    res.json({ success: true, animation: publicAnimation(animation) });
+});
+
+// ---- Change an animation's visibility (public/private) ----
+app.post('/animations/:id/visibility', (req, res) => {
+    const animation = findAnimationById(req.params.id);
+    if (!animation || animation.deleted) return res.status(404).json({ error: 'not-found', message: 'That animation does not exist.' });
+    if (!requireAssetOwner(req, res, animation)) return;
+    const visibility = (req.body.visibility || '').toString().toLowerCase().trim();
+    if (visibility !== 'public' && visibility !== 'private') {
+        return res.status(400).json({ error: 'invalid-visibility', message: 'Visibility must be "public" or "private".' });
+    }
+    animation.visibility = visibility;
+    saveAnimationsIndex();
+    res.json({ success: true, animation: publicAnimation(animation) });
+});
+
+// ---- Permanently delete an animation (Creations -> "..." settings -> Delete Forever) ----
+app.delete('/animations/:id', (req, res) => {
+    const animation = findAnimationById(req.params.id);
+    if (!animation || animation.deleted) return res.status(404).json({ error: 'not-found', message: 'That animation does not exist.' });
+    if (!requireAssetOwner(req, res, animation)) return;
+    try {
+        const filePath = path.join(ANIMATION_UPLOADS_DIR, animation.filename);
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    } catch (err) {
+        console.error('Failed to remove animation file on delete:', err);
+    }
+    animation.deleted = true;
+    saveAnimationsIndex();
+    res.json({ success: true });
 });
 
 // ================= TOOLBOX ASSETS =================
