@@ -42,6 +42,14 @@ if (!fs.existsSync(CATALOG_UPLOADS_DIR)) fs.mkdirSync(CATALOG_UPLOADS_DIR, { rec
 const BADGE_UPLOADS_DIR = path.join(UPLOADS_DIR, 'badges');
 if (!fs.existsSync(BADGE_UPLOADS_DIR)) fs.mkdirSync(BADGE_UPLOADS_DIR, { recursive: true });
 
+// Where uploaded Sound (mp3/ogg/wav) and Decal (png/jpg) assets get written, from
+// Retroblox Studio's Creations window ("Sounds"/"Decals" tabs). Same ephemeral-disk
+// caveat as UPLOADS_DIR above.
+const SOUND_UPLOADS_DIR = path.join(UPLOADS_DIR, 'sounds');
+if (!fs.existsSync(SOUND_UPLOADS_DIR)) fs.mkdirSync(SOUND_UPLOADS_DIR, { recursive: true });
+const DECAL_UPLOADS_DIR = path.join(UPLOADS_DIR, 'decals');
+if (!fs.existsSync(DECAL_UPLOADS_DIR)) fs.mkdirSync(DECAL_UPLOADS_DIR, { recursive: true });
+
 console.log(`[storage] Using DATA_DIR: ${DATA_DIR}`);
 
 // Public base URL other machines use to reach THIS server. Catalog item images are
@@ -2023,6 +2031,378 @@ app.delete('/catalog/:id', (req, res) => {
     catalogItems.splice(idx, 1);
     saveCatalogItemsIndex();
     res.json({ success: true });
+});
+
+// ================= SOUNDS & DECALS =================
+// Audio (mp3/ogg/wav) and image (png/jpg) assets uploaded from Retroblox Studio's
+// Creations window (CREATIONS -> Development Items -> Sounds / Decals -> Upload).
+// Each gets a real numeric asset id, exactly like Roblox's own asset ids, referenced
+// in-editor as cbxassetid://<id> (this project's own asset scheme, parallel to real
+// Roblox's rbxassetid://<id>) from the Sound.SoundId / Decal.Texture property rows.
+//
+// Visibility works like this:
+//   - "public"  - anyone, in any game, can reference and hear/see this asset.
+//   - "private" - silent/invisible in anyone else's games, but any game owned by the
+//                 SAME account that uploaded it can still use it. This is checked by
+//                 /assets/:id/resolve below, which is what cbxassetid:// resolution
+//                 in Studio/the player actually calls - it takes the requesting game's
+//                 id, looks up that game's creator, and only serves the asset if the
+//                 asset is public OR the game's creator matches the asset's owner.
+const SOUNDS_FILE = path.join(DATA_DIR, 'sounds.json');
+const SOUND_ID_COUNTER_FILE = path.join(DATA_DIR, 'sound_id_counter.json');
+const DECALS_FILE = path.join(DATA_DIR, 'decals.json');
+const DECAL_ID_COUNTER_FILE = path.join(DATA_DIR, 'decal_id_counter.json');
+
+const SOUND_MAX_BYTES = 10 * 1024 * 1024; // 10MB
+const DECAL_MAX_BYTES = 5 * 1024 * 1024;  // 5MB
+const SOUND_ALLOWED_MIMES = {
+    'audio/mpeg': 'mp3', 'audio/mp3': 'mp3',
+    'audio/ogg': 'ogg', 'application/ogg': 'ogg',
+    'audio/wav': 'wav', 'audio/x-wav': 'wav', 'audio/wave': 'wav'
+};
+const DECAL_ALLOWED_MIMES = {
+    'image/png': 'png',
+    'image/jpeg': 'jpg', 'image/jpg': 'jpg'
+};
+
+let sounds = [];
+try {
+    sounds = JSON.parse(fs.readFileSync(SOUNDS_FILE, 'utf8'));
+    console.log(`[storage] Loaded ${sounds.length} sound(s) from ${SOUNDS_FILE}`);
+} catch (e) {
+    sounds = [];
+    console.log(`[storage] No existing sounds.json found at ${SOUNDS_FILE} (starting empty). Reason: ${e.code || e.message}`);
+}
+sounds.forEach(s => { if (s.visibility !== 'private') s.visibility = 'public'; });
+function saveSoundsIndex() {
+    try {
+        fs.writeFileSync(SOUNDS_FILE, JSON.stringify(sounds, null, 2));
+    } catch (e) {
+        console.error('Failed to save sounds index:', e);
+    }
+}
+
+let decals = [];
+try {
+    decals = JSON.parse(fs.readFileSync(DECALS_FILE, 'utf8'));
+    console.log(`[storage] Loaded ${decals.length} decal(s) from ${DECALS_FILE}`);
+} catch (e) {
+    decals = [];
+    console.log(`[storage] No existing decals.json found at ${DECALS_FILE} (starting empty). Reason: ${e.code || e.message}`);
+}
+decals.forEach(d => { if (d.visibility !== 'private') d.visibility = 'public'; });
+function saveDecalsIndex() {
+    try {
+        fs.writeFileSync(DECALS_FILE, JSON.stringify(decals, null, 2));
+    } catch (e) {
+        console.error('Failed to save decals index:', e);
+    }
+}
+
+// Sound and Decal ids share one counter, same as real Roblox where every asset type
+// (sounds, decals, models, places...) is drawn from one global id space - so a sound
+// and a decal can never collide on the same cbxassetid:// number.
+let nextAssetId = 1;
+try {
+    const counterData = JSON.parse(fs.readFileSync(SOUND_ID_COUNTER_FILE, 'utf8'));
+    if (typeof counterData.next === 'number' && counterData.next > 0) nextAssetId = counterData.next;
+} catch (e) { /* no counter file yet - fine */ }
+try {
+    const counterData = JSON.parse(fs.readFileSync(DECAL_ID_COUNTER_FILE, 'utf8'));
+    if (typeof counterData.next === 'number' && counterData.next > nextAssetId) nextAssetId = counterData.next;
+} catch (e) { /* no counter file yet - fine */ }
+function saveAssetIdCounter() {
+    try {
+        fs.writeFileSync(SOUND_ID_COUNTER_FILE, JSON.stringify({ next: nextAssetId }));
+        fs.writeFileSync(DECAL_ID_COUNTER_FILE, JSON.stringify({ next: nextAssetId }));
+    } catch (e) {
+        console.error('Failed to save asset ID counter:', e);
+    }
+}
+
+function findSoundById(id) { return sounds.find(s => String(s.id) === String(id)); }
+function findDecalById(id) { return decals.find(d => String(d.id) === String(id)); }
+
+// Public-safe view - never includes the raw file path, just the id/name/owner/visibility
+// and a playable/viewable URL. `viewerIsOwner` is attached by callers that already know
+// who's asking (the Creations window listing), not by this function itself.
+function publicSound(s) {
+    return {
+        id: s.id,
+        name: s.name,
+        assetUrl: `${PUBLIC_SERVER_URL}/sounds/file/${s.filename}`,
+        cbxassetid: `cbxassetid://${s.id}`,
+        creator: s.creator,
+        visibility: s.visibility,
+        createdAt: s.createdAt
+    };
+}
+function publicDecal(d) {
+    return {
+        id: d.id,
+        name: d.name,
+        assetUrl: `${PUBLIC_SERVER_URL}/decals/file/${d.filename}`,
+        cbxassetid: `cbxassetid://${d.id}`,
+        creator: d.creator,
+        visibility: d.visibility,
+        createdAt: d.createdAt
+    };
+}
+
+function requireAssetOwner(req, res, asset) {
+    const username = (req.body.username || req.query.username || '').toString().trim();
+    if (!username || username.toLowerCase() !== (asset.creator || '').toString().trim().toLowerCase()) {
+        res.status(403).json({ error: 'not-owner', message: 'Only this asset\'s creator can change it.' });
+        return false;
+    }
+    return true;
+}
+
+const soundUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: SOUND_MAX_BYTES }
+});
+const decalUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: DECAL_MAX_BYTES }
+});
+
+// Serve uploaded sound/decal files as plain static files.
+app.use('/sounds/file', express.static(SOUND_UPLOADS_DIR));
+app.use('/decals/file', express.static(DECAL_UPLOADS_DIR));
+
+// ---- Upload a new Sound (Studio Creations -> Sounds -> Upload) ----
+// Accepts mp3/ogg/wav, max 10MB (SOUND_MAX_BYTES). Free - no Robux cost, unlike Catalog
+// items - Sounds/Decals are plain building-block assets like Toolbox uploads.
+app.post('/sounds/upload', (req, res) => {
+    soundUpload.single('file')(req, res, (err) => {
+        if (err) {
+            if (err.code === 'LIMIT_FILE_SIZE') {
+                return res.status(400).json({ error: 'file-too-large', message: 'Sounds can\'t be over 10MB.' });
+            }
+            console.error('Sound upload error:', err);
+            return res.status(500).json({ error: 'upload-failed', message: 'Something went wrong uploading that sound.' });
+        }
+        try {
+            const account = findAccountByUsername((req.body.username || '').toString());
+            if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found. Log in to upload sounds.' });
+            if (liftBanIfExpired(account)) saveAccountsIndex();
+            if (account.banned) return res.status(403).json({ error: 'banned', message: 'Banned accounts cannot upload sounds.' });
+
+            const name = (req.body.name || '').toString().trim().slice(0, 60) || 'Untitled Sound';
+
+            if (!req.file) return res.status(400).json({ error: 'no-file', message: 'An MP3, OGG, or WAV file is required.' });
+            const mime = (req.file.mimetype || '').toLowerCase();
+            const ext = SOUND_ALLOWED_MIMES[mime];
+            if (!ext) {
+                return res.status(400).json({ error: 'invalid-file-type', message: 'Sounds must be an MP3, OGG, or WAV file.' });
+            }
+
+            const visibility = (req.body.visibility || '').toString().toLowerCase().trim() === 'private' ? 'private' : 'public';
+
+            const id = nextAssetId++;
+            saveAssetIdCounter();
+
+            const filename = `${id}.${ext}`;
+            fs.writeFileSync(path.join(SOUND_UPLOADS_DIR, filename), req.file.buffer);
+
+            const sound = {
+                id, name, filename,
+                creator: account.username,
+                visibility,
+                createdAt: Date.now(),
+                deleted: false
+            };
+            sounds.push(sound);
+            saveSoundsIndex();
+
+            res.json({ success: true, sound: publicSound(sound) });
+        } catch (err2) {
+            console.error('Sound upload error:', err2);
+            res.status(500).json({ error: 'upload-failed', message: 'Something went wrong uploading that sound.' });
+        }
+    });
+});
+
+// ---- Upload a new Decal (Studio Creations -> Decals -> Upload) ----
+// Accepts png/jpg, max 5MB (DECAL_MAX_BYTES).
+app.post('/decals/upload', (req, res) => {
+    decalUpload.single('file')(req, res, (err) => {
+        if (err) {
+            if (err.code === 'LIMIT_FILE_SIZE') {
+                return res.status(400).json({ error: 'file-too-large', message: 'Decals can\'t be over 5MB.' });
+            }
+            console.error('Decal upload error:', err);
+            return res.status(500).json({ error: 'upload-failed', message: 'Something went wrong uploading that decal.' });
+        }
+        try {
+            const account = findAccountByUsername((req.body.username || '').toString());
+            if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found. Log in to upload decals.' });
+            if (liftBanIfExpired(account)) saveAccountsIndex();
+            if (account.banned) return res.status(403).json({ error: 'banned', message: 'Banned accounts cannot upload decals.' });
+
+            const name = (req.body.name || '').toString().trim().slice(0, 60) || 'Untitled Decal';
+
+            if (!req.file) return res.status(400).json({ error: 'no-file', message: 'A PNG or JPG file is required.' });
+            const mime = (req.file.mimetype || '').toLowerCase();
+            const ext = DECAL_ALLOWED_MIMES[mime];
+            if (!ext) {
+                return res.status(400).json({ error: 'invalid-file-type', message: 'Decals must be a PNG or JPG file.' });
+            }
+
+            const visibility = (req.body.visibility || '').toString().toLowerCase().trim() === 'private' ? 'private' : 'public';
+
+            const id = nextAssetId++;
+            saveAssetIdCounter();
+
+            const filename = `${id}.${ext}`;
+            fs.writeFileSync(path.join(DECAL_UPLOADS_DIR, filename), req.file.buffer);
+
+            const decal = {
+                id, name, filename,
+                creator: account.username,
+                visibility,
+                createdAt: Date.now(),
+                deleted: false
+            };
+            decals.push(decal);
+            saveDecalsIndex();
+
+            res.json({ success: true, decal: publicDecal(decal) });
+        } catch (err2) {
+            console.error('Decal upload error:', err2);
+            res.status(500).json({ error: 'upload-failed', message: 'Something went wrong uploading that decal.' });
+        }
+    });
+});
+
+// ---- List every sound/decal a player has uploaded (Studio Creations -> Sounds/Decals) ----
+app.get('/accounts/:username/sounds', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+    const list = sounds
+        .filter(s => !s.deleted && s.creator.toLowerCase() === account.username.toLowerCase())
+        .map(publicSound);
+    res.json({ sounds: list });
+});
+app.get('/accounts/:username/decals', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+    const list = decals
+        .filter(d => !d.deleted && d.creator.toLowerCase() === account.username.toLowerCase())
+        .map(publicDecal);
+    res.json({ decals: list });
+});
+
+// ---- Rename a sound/decal ----
+app.post('/sounds/:id/rename', (req, res) => {
+    const sound = findSoundById(req.params.id);
+    if (!sound || sound.deleted) return res.status(404).json({ error: 'not-found', message: 'That sound does not exist.' });
+    if (!requireAssetOwner(req, res, sound)) return;
+    const name = (req.body.name || '').toString().trim();
+    if (!name) return res.status(400).json({ error: 'invalid-name', message: 'Name cannot be empty.' });
+    sound.name = name.slice(0, 60);
+    saveSoundsIndex();
+    res.json({ success: true, sound: publicSound(sound) });
+});
+app.post('/decals/:id/rename', (req, res) => {
+    const decal = findDecalById(req.params.id);
+    if (!decal || decal.deleted) return res.status(404).json({ error: 'not-found', message: 'That decal does not exist.' });
+    if (!requireAssetOwner(req, res, decal)) return;
+    const name = (req.body.name || '').toString().trim();
+    if (!name) return res.status(400).json({ error: 'invalid-name', message: 'Name cannot be empty.' });
+    decal.name = name.slice(0, 60);
+    saveDecalsIndex();
+    res.json({ success: true, decal: publicDecal(decal) });
+});
+
+// ---- Change a sound/decal's visibility (public/private) ----
+// Private means silent/invisible in anyone else's games - see /assets/:id/resolve below
+// for how that's actually enforced when a game tries to use a cbxassetid://.
+app.post('/sounds/:id/visibility', (req, res) => {
+    const sound = findSoundById(req.params.id);
+    if (!sound || sound.deleted) return res.status(404).json({ error: 'not-found', message: 'That sound does not exist.' });
+    if (!requireAssetOwner(req, res, sound)) return;
+    const visibility = (req.body.visibility || '').toString().toLowerCase().trim();
+    if (visibility !== 'public' && visibility !== 'private') {
+        return res.status(400).json({ error: 'invalid-visibility', message: 'Visibility must be "public" or "private".' });
+    }
+    sound.visibility = visibility;
+    saveSoundsIndex();
+    res.json({ success: true, sound: publicSound(sound) });
+});
+app.post('/decals/:id/visibility', (req, res) => {
+    const decal = findDecalById(req.params.id);
+    if (!decal || decal.deleted) return res.status(404).json({ error: 'not-found', message: 'That decal does not exist.' });
+    if (!requireAssetOwner(req, res, decal)) return;
+    const visibility = (req.body.visibility || '').toString().toLowerCase().trim();
+    if (visibility !== 'public' && visibility !== 'private') {
+        return res.status(400).json({ error: 'invalid-visibility', message: 'Visibility must be "public" or "private".' });
+    }
+    decal.visibility = visibility;
+    saveDecalsIndex();
+    res.json({ success: true, decal: publicDecal(decal) });
+});
+
+// ---- Permanently delete a sound/decal (Creations -> "..." settings -> Delete Forever) ----
+app.delete('/sounds/:id', (req, res) => {
+    const sound = findSoundById(req.params.id);
+    if (!sound || sound.deleted) return res.status(404).json({ error: 'not-found', message: 'That sound does not exist.' });
+    if (!requireAssetOwner(req, res, sound)) return;
+    try {
+        const filePath = path.join(SOUND_UPLOADS_DIR, sound.filename);
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    } catch (err) {
+        console.error('Failed to remove sound file on delete:', err);
+    }
+    sound.deleted = true;
+    saveSoundsIndex();
+    res.json({ success: true });
+});
+app.delete('/decals/:id', (req, res) => {
+    const decal = findDecalById(req.params.id);
+    if (!decal || decal.deleted) return res.status(404).json({ error: 'not-found', message: 'That decal does not exist.' });
+    if (!requireAssetOwner(req, res, decal)) return;
+    try {
+        const filePath = path.join(DECAL_UPLOADS_DIR, decal.filename);
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    } catch (err) {
+        console.error('Failed to remove decal file on delete:', err);
+    }
+    decal.deleted = true;
+    saveDecalsIndex();
+    res.json({ success: true });
+});
+
+// ---- Resolve a cbxassetid:// asset id to a real playable/viewable URL ----
+// This is the gate that actually enforces public/private visibility: a public asset
+// resolves for anyone; a private asset only resolves when ?gameId=<id> names a game
+// owned by the SAME account that uploaded the asset (checked by comparing the asset's
+// creator to that game's creator) - matching "private means it appears silent/invisible
+// to anyone else's games, but any game YOU own can still use it". With no gameId, or a
+// gameId for a game you don't own, a private asset 404s exactly as if it didn't exist.
+app.get('/assets/:id/resolve', (req, res) => {
+    const id = req.params.id;
+    const gameId = (req.query.gameId || '').toString().trim();
+
+    let asset = findSoundById(id);
+    let kind = 'sound';
+    if (!asset) { asset = findDecalById(id); kind = 'decal'; }
+    if (!asset || asset.deleted) return res.status(404).json({ error: 'not-found', message: 'That asset does not exist.' });
+
+    if (asset.visibility === 'private') {
+        const game = gameId ? games.find(g => g.id === gameId) : null;
+        const owns = game && game.creator && game.creator.toLowerCase() === (asset.creator || '').toLowerCase();
+        if (!owns) return res.status(404).json({ error: 'not-found', message: 'That asset does not exist.' });
+    }
+
+    res.json({
+        success: true,
+        kind,
+        id: asset.id,
+        name: asset.name,
+        assetUrl: kind === 'sound' ? `${PUBLIC_SERVER_URL}/sounds/file/${asset.filename}` : `${PUBLIC_SERVER_URL}/decals/file/${asset.filename}`
+    });
 });
 
 // ================= TOOLBOX ASSETS =================
