@@ -56,6 +56,14 @@ if (!fs.existsSync(DECAL_UPLOADS_DIR)) fs.mkdirSync(DECAL_UPLOADS_DIR, { recursi
 const ANIMATION_UPLOADS_DIR = path.join(UPLOADS_DIR, 'animations');
 if (!fs.existsSync(ANIMATION_UPLOADS_DIR)) fs.mkdirSync(ANIMATION_UPLOADS_DIR, { recursive: true });
 
+// Where local place-file opens get cached server-side (Studio's FILE > "Recent Files"
+// list, populated from both Studio's own "Open from File..." and editor.html's Import
+// Place/CRBX/XML/LZ4/ZSTD pickers) - the actual bytes are kept here so clicking a
+// recent-files entry can genuinely re-open it in a fresh tab, not just re-show its
+// name. Same ephemeral-disk caveat as UPLOADS_DIR above.
+const RECENT_FILES_DIR = path.join(UPLOADS_DIR, 'recent-files');
+if (!fs.existsSync(RECENT_FILES_DIR)) fs.mkdirSync(RECENT_FILES_DIR, { recursive: true });
+
 console.log(`[storage] Using DATA_DIR: ${DATA_DIR}`);
 
 // Public base URL other machines use to reach THIS server. Catalog item images are
@@ -2433,6 +2441,167 @@ app.delete('/decals/:id', (req, res) => {
     res.json({ success: true });
 });
 
+// ================= RECENT FILES (Studio FILE > "Recent Files") =================
+// Tracks local place-file opens per account - populated from Studio's own "Open from
+// File..." AND from editor.html's Import Place/CRBX/XML/LZ4/ZSTD pickers (both log
+// here, see the matching client-side calls). Only real Roblox place files (.rbxl/
+// .rbxlx, binary or XML) and Retroblox's own native .crbx are accepted - nothing else
+// makes sense as a "recent place file". Per-account list is capped at
+// MAX_RECENT_FILES; opening past the cap evicts the oldest entry (both its index row
+// and its on-disk bytes) to make room. Entries also expire automatically after
+// RECENT_FILE_RETENTION_MS regardless of the cap, via the sweep near the bottom of
+// this file (same "automatically" pattern as the ban-expiry and archive-expiry
+// sweeps).
+const RECENT_FILES_INDEX_FILE = path.join(DATA_DIR, 'recent_files.json');
+const RECENT_FILE_ID_COUNTER_FILE = path.join(DATA_DIR, 'recent_file_id_counter.json');
+const MAX_RECENT_FILES = 10;
+const RECENT_FILE_RETENTION_MS = 3 * 24 * 60 * 60 * 1000; // 3 days
+const RECENT_FILE_MAX_BYTES = 50 * 1024 * 1024; // 50MB - matches the general game-upload cap
+// Extension is what decides file "type" here (not sniffed content) since the point of
+// this list is just "what did you open recently", by the same name/extension a real
+// Windows Explorer MRU list would show - .rbxl and .rbxlx cover both binary and XML
+// Roblox place files, .crbx is Retroblox's own native format.
+const RECENT_FILE_ALLOWED_EXTS = ['rbxl', 'rbxlx', 'crbx'];
+
+let recentFiles = [];
+try {
+    recentFiles = JSON.parse(fs.readFileSync(RECENT_FILES_INDEX_FILE, 'utf8'));
+    console.log(`[storage] Loaded ${recentFiles.length} recent file(s) from ${RECENT_FILES_INDEX_FILE}`);
+} catch (e) {
+    recentFiles = [];
+    console.log(`[storage] No existing recent_files.json found at ${RECENT_FILES_INDEX_FILE} (starting empty). Reason: ${e.code || e.message}`);
+}
+function saveRecentFilesIndex() {
+    try {
+        fs.writeFileSync(RECENT_FILES_INDEX_FILE, JSON.stringify(recentFiles, null, 2));
+    } catch (e) {
+        console.error('Failed to save recent files index:', e);
+    }
+}
+
+let nextRecentFileId = 1;
+try {
+    const counterData = JSON.parse(fs.readFileSync(RECENT_FILE_ID_COUNTER_FILE, 'utf8'));
+    if (typeof counterData.next === 'number' && counterData.next > 0) nextRecentFileId = counterData.next;
+} catch (e) { /* no counter file yet - fine */ }
+function saveRecentFileIdCounter() {
+    try {
+        fs.writeFileSync(RECENT_FILE_ID_COUNTER_FILE, JSON.stringify({ next: nextRecentFileId }));
+    } catch (e) {
+        console.error('Failed to save recent file ID counter:', e);
+    }
+}
+
+function findRecentFileById(id) { return recentFiles.find(r => String(r.id) === String(id)); }
+
+// Removes one recent-file entry from both the in-memory/disk index and its on-disk
+// bytes. Callers are responsible for calling saveRecentFilesIndex() afterward (batched
+// by the cap-eviction and expiry-sweep callers below, rather than saving once per
+// entry removed).
+function deleteRecentFileEntry(entry) {
+    try {
+        const filePath = path.join(RECENT_FILES_DIR, entry.filename);
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    } catch (err) {
+        console.error('Failed to remove recent file bytes on delete:', err);
+    }
+    recentFiles = recentFiles.filter(r => r.id !== entry.id);
+}
+
+function publicRecentFile(r) {
+    return {
+        id: r.id,
+        name: r.name, // full "name.ext", exactly as opened
+        openedAt: r.openedAt
+    };
+}
+
+const recentFileUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: RECENT_FILE_MAX_BYTES }
+});
+
+// ---- Log a local place-file open (Studio "Open from File...", or editor.html's ----
+// ---- Import Place/CRBX/XML/LZ4/ZSTD pickers) and cache its bytes for re-opening. ----
+app.post('/accounts/:username/recent-files', (req, res) => {
+    recentFileUpload.single('file')(req, res, (err) => {
+        if (err) {
+            if (err.code === 'LIMIT_FILE_SIZE') {
+                return res.status(400).json({ error: 'file-too-large', message: 'That file is too large to keep in Recent Files.' });
+            }
+            console.error('Recent file upload error:', err);
+            return res.status(500).json({ error: 'upload-failed', message: 'Something went wrong logging that file.' });
+        }
+        try {
+            const account = findAccountByUsername(req.params.username);
+            if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+            if (!req.file) return res.status(400).json({ error: 'no-file', message: 'A file is required.' });
+
+            // Full "name.ext" exactly as opened - not just the base name, and not
+            // re-derived from the mimetype, since the point is showing/reopening
+            // literally what was opened.
+            const rawName = (req.body.name || req.file.originalname || '').toString().trim().slice(0, 200);
+            if (!rawName) return res.status(400).json({ error: 'invalid-name', message: 'Missing file name.' });
+            const extMatch = /\.([a-z0-9]+)$/i.exec(rawName);
+            const ext = extMatch ? extMatch[1].toLowerCase() : '';
+            if (!RECENT_FILE_ALLOWED_EXTS.includes(ext)) {
+                return res.status(400).json({ error: 'invalid-file-type', message: 'Recent Files only tracks .rbxl, .rbxlx, and .crbx files.' });
+            }
+
+            const id = nextRecentFileId++;
+            saveRecentFileIdCounter();
+            const filename = `${id}.${ext}`;
+            fs.writeFileSync(path.join(RECENT_FILES_DIR, filename), req.file.buffer);
+
+            const entry = {
+                id,
+                name: rawName,
+                filename,
+                owner: account.username,
+                openedAt: Date.now()
+            };
+
+            // Cap at MAX_RECENT_FILES per account - opening past the cap evicts the
+            // oldest entry (lowest openedAt) to make room, same "least-recently-opened
+            // gets bumped" behavior as a real MRU list.
+            let mine = recentFiles.filter(r => r.owner.toLowerCase() === account.username.toLowerCase());
+            mine.sort((a, b) => a.openedAt - b.openedAt); // oldest first
+            while (mine.length >= MAX_RECENT_FILES) {
+                deleteRecentFileEntry(mine.shift());
+            }
+
+            recentFiles.push(entry);
+            saveRecentFilesIndex();
+
+            res.json({ success: true, file: publicRecentFile(entry) });
+        } catch (err2) {
+            console.error('Recent file log error:', err2);
+            res.status(500).json({ error: 'upload-failed', message: 'Something went wrong logging that file.' });
+        }
+    });
+});
+
+// ---- List an account's Recent Files, most recently opened first ----
+app.get('/accounts/:username/recent-files', (req, res) => {
+    const account = findAccountByUsername(req.params.username);
+    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
+    const list = recentFiles
+        .filter(r => r.owner.toLowerCase() === account.username.toLowerCase())
+        .sort((a, b) => b.openedAt - a.openedAt)
+        .map(publicRecentFile);
+    res.json({ files: list });
+});
+
+// ---- Fetch a Recent Files entry's raw bytes, to re-open it (Studio's FILE menu ----
+// ---- links each entry straight to editor.html?openRecent=<id> in a new tab). ----
+app.get('/recent-files/:id/content', (req, res) => {
+    const entry = findRecentFileById(req.params.id);
+    if (!entry) return res.status(404).json({ error: 'not-found', message: 'That recent file is no longer available.' });
+    const filePath = path.join(RECENT_FILES_DIR, entry.filename);
+    if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'not-found', message: 'That recent file is no longer available.' });
+    res.json({ name: entry.name, dataBase64: fs.readFileSync(filePath).toString('base64') });
+});
+
 // ---- Resolve a cbxassetid:// asset id to a real playable/viewable URL ----
 // This is the gate that actually enforces public/private visibility: a public asset
 // resolves for anyone; a private asset only resolves when ?gameId=<id> names a game
@@ -4122,6 +4291,19 @@ setInterval(() => {
     games = games.filter(g => !(g.archived && g.archivedAt && g.archivedAt <= cutoff));
     saveGamesIndex();
     console.log(`[archive-sweep] Permanently deleted ${expired.length} game(s) archived 7+ days ago.`);
+}, 60 * 1000);
+
+// Recent-files expiry sweep: every minute, permanently delete any Recent Files entry
+// older than RECENT_FILE_RETENTION_MS (3 days) - same "automatically" pattern as the
+// ban-expiry and archive-expiry sweeps above, independent of the MAX_RECENT_FILES cap
+// eviction (which only fires on a new open, not on a timer).
+setInterval(() => {
+    const cutoff = Date.now() - RECENT_FILE_RETENTION_MS;
+    const expired = recentFiles.filter(r => r.openedAt <= cutoff);
+    if (expired.length === 0) return;
+    expired.forEach(entry => deleteRecentFileEntry(entry));
+    saveRecentFilesIndex();
+    console.log(`[recent-files-sweep] Permanently deleted ${expired.length} recent file(s) older than 3 days.`);
 }, 60 * 1000);
 
 // ================= 404 CATCH-ALL =================
