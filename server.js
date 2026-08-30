@@ -487,9 +487,12 @@ const CATEGORY_APPEARANCE_SLOT = {
     neck: 'equippedNeck', shoulder: 'equippedShoulder', front: 'equippedFront',
     back: 'equippedBack', waist: 'equippedWaist', faces: 'equippedFace'
 };
-const UPLOAD_FEE_ROBUX = 5;    // charged to the uploader every time, regardless of the item's own price/currency
-const MIN_ITEM_PRICE = 2;
-const MAX_ITEM_PRICE = 9999999;
+const UPLOAD_FEE_ROBUX = 5;    // charged to the uploader for clothing uploads (faces are free - see FACE_CATEGORY check
+                                // in /catalog/upload below) - waived entirely for admins. Credited to the RETROBLOX
+                                // system account (see RETROBLOX_SYSTEM_ACCOUNT_USERNAME) rather than just vanishing.
+const RETROBLOX_SYSTEM_ACCOUNT_USERNAME = 'retroblox';
+const MIN_ITEM_PRICE = 5;
+const MAX_ITEM_PRICE = 1000000;
 
 let catalogItems = [];
 try {
@@ -1903,7 +1906,14 @@ app.post('/catalog/upload', catalogImageUpload.single('image'), (req, res) => {
             return res.status(400).json({ error: 'invalid-currency', message: 'Currency must be Robux or Tix.' });
         }
 
-        if ((account.robux || 0) < UPLOAD_FEE_ROBUX) {
+        // Faces are always free to upload. Admins upload everything free too. Everyone
+        // else pays the flat UPLOAD_FEE_ROBUX for clothing (T-Shirts/Shirts/Pants) and
+        // accessories - that fee goes to the RETROBLOX system account below rather than
+        // just disappearing.
+        const isFaceUpload = category === FACE_CATEGORY;
+        const chargeUploadFee = !isFaceUpload && !isAdmin;
+
+        if (chargeUploadFee && (account.robux || 0) < UPLOAD_FEE_ROBUX) {
             return res.status(400).json({ error: 'insufficient-robux', message: `Uploading costs ${UPLOAD_FEE_ROBUX} Robux - you don't have enough.` });
         }
 
@@ -1974,7 +1984,18 @@ app.post('/catalog/upload', catalogImageUpload.single('image'), (req, res) => {
             itemPath = `${PUBLIC_SERVER_URL}/catalog/image/${filename}`;
         }
 
-        account.robux = (account.robux || 0) - UPLOAD_FEE_ROBUX;
+        if (chargeUploadFee) {
+            account.robux = (account.robux || 0) - UPLOAD_FEE_ROBUX;
+            // Credit the fee to the RETROBLOX system account instead of it just vanishing
+            // - mirrors how a catalog purchase pays the item's creator (see
+            // /accounts/:username/inventory/buy below). Guard against the uploader
+            // somehow being the RETROBLOX account itself (isAdmin already skips the fee
+            // for it, so this is just defensive) and against that account not existing.
+            const retrobloxAccount = findAccountByUsername(RETROBLOX_SYSTEM_ACCOUNT_USERNAME);
+            if (retrobloxAccount && retrobloxAccount.username !== account.username) {
+                retrobloxAccount.robux = (retrobloxAccount.robux || 0) + UPLOAD_FEE_ROBUX;
+            }
+        }
         saveAccountsIndex();
 
         const item = {
@@ -2038,6 +2059,22 @@ app.post('/catalog/:id/rename', (req, res) => {
     const name = (req.body.name || '').toString().trim();
     if (!name) return res.status(400).json({ error: 'invalid-name', message: 'Name cannot be empty.' });
     item.name = name.slice(0, 60);
+
+    saveCatalogItemsIndex();
+    res.json({ success: true, item: publicCatalogItem(item) });
+});
+
+// ---- Change a catalog item's description (Creations -> item's "..." settings) ----
+// Every catalog item requires a non-empty description at upload time (see
+// /catalog/upload above), so this mirrors that - it can be edited, but not cleared.
+app.post('/catalog/:id/description', (req, res) => {
+    const item = findCatalogItemById(req.params.id);
+    if (!item) return res.status(404).json({ error: 'not-found', message: 'That catalog item does not exist.' });
+    if (!requireCatalogItemOwner(req, res, item)) return;
+
+    const description = (req.body.description || '').toString().trim();
+    if (!description) return res.status(400).json({ error: 'invalid-description', message: 'Description cannot be empty.' });
+    item.description = description.slice(0, 1000);
 
     saveCatalogItemsIndex();
     res.json({ success: true, item: publicCatalogItem(item) });
@@ -2461,254 +2498,6 @@ app.delete('/decals/:id', (req, res) => {
     }
     decal.deleted = true;
     saveDecalsIndex();
-    res.json({ success: true });
-});
-
-// ================= AVATAR ITEMS: T-Shirts / Shirts / Pants / Faces =================
-// Studio Creations -> Avatar Items -> Clothes (T-Shirts/Shirts/Pants) and Bodies -> Face.
-// Deliberately mirrors the Sounds/Decals pattern above (free upload, name + optional
-// description, Public/Private visibility, rename/delete, own image) rather than the
-// older /catalog/upload flow (which requires a price/currency and costs Robux) - these
-// are plain building-block avatar images, not marketplace catalog listings. T-Shirts/
-// Shirts/Pants are open to everyone; Faces are admin-only (same rule the old catalog
-// route already enforced for the "faces" category).
-const AVATAR_ITEM_CATEGORIES = ['tshirts', 'shirts', 'pants', 'faces'];
-const AVATAR_ITEM_ADMIN_ONLY_CATEGORIES = ['faces'];
-const AVATAR_ITEM_UPLOADS_DIR = path.join(UPLOADS_DIR, 'avatar-items');
-if (!fs.existsSync(AVATAR_ITEM_UPLOADS_DIR)) fs.mkdirSync(AVATAR_ITEM_UPLOADS_DIR, { recursive: true });
-const AVATAR_ITEMS_FILE = path.join(DATA_DIR, 'avatar_items.json');
-const AVATAR_ITEM_ID_COUNTER_FILE = path.join(DATA_DIR, 'avatar_item_id_counter.json');
-const AVATAR_ITEM_MAX_BYTES = 5 * 1024 * 1024; // 5MB, same ceiling as Decals
-const AVATAR_ITEM_ALLOWED_MIMES = {
-    'image/png': 'png',
-    'image/jpeg': 'jpg', 'image/jpg': 'jpg'
-};
-
-let avatarItems = [];
-try {
-    avatarItems = JSON.parse(fs.readFileSync(AVATAR_ITEMS_FILE, 'utf8'));
-    console.log(`[storage] Loaded ${avatarItems.length} avatar item(s) from ${AVATAR_ITEMS_FILE}`);
-} catch (e) {
-    avatarItems = [];
-    console.log(`[storage] No existing avatar_items.json found at ${AVATAR_ITEMS_FILE} (starting empty). Reason: ${e.code || e.message}`);
-}
-avatarItems.forEach(i => { if (i.visibility !== 'private') i.visibility = 'public'; });
-function saveAvatarItemsIndex() {
-    try {
-        fs.writeFileSync(AVATAR_ITEMS_FILE, JSON.stringify(avatarItems, null, 2));
-    } catch (e) {
-        console.error('Failed to save avatar items index:', e);
-    }
-}
-
-let nextAvatarItemId = 1;
-try {
-    const counterData = JSON.parse(fs.readFileSync(AVATAR_ITEM_ID_COUNTER_FILE, 'utf8'));
-    if (typeof counterData.next === 'number' && counterData.next > 0) nextAvatarItemId = counterData.next;
-} catch (e) { /* no counter file yet - fine */ }
-function saveAvatarItemIdCounter() {
-    try {
-        fs.writeFileSync(AVATAR_ITEM_ID_COUNTER_FILE, JSON.stringify({ next: nextAvatarItemId }));
-    } catch (e) {
-        console.error('Failed to save avatar item ID counter:', e);
-    }
-}
-
-function findAvatarItemById(id) { return avatarItems.find(i => String(i.id) === String(id)); }
-
-// Public-safe view, same shape/spirit as publicSound/publicDecal above.
-function publicAvatarItem(i) {
-    return {
-        id: i.id,
-        name: i.name,
-        description: i.description || '',
-        category: i.category,
-        assetUrl: `${PUBLIC_SERVER_URL}/avatar-items/file/${i.filename}`,
-        cbxassetid: `cbxassetid://${i.id}`,
-        creator: i.creator,
-        visibility: i.visibility,
-        createdAt: i.createdAt
-    };
-}
-
-const avatarItemUpload = multer({
-    storage: multer.memoryStorage(),
-    limits: { fileSize: AVATAR_ITEM_MAX_BYTES }
-});
-
-// Serve uploaded avatar item images as plain static files.
-app.use('/avatar-items/file', express.static(AVATAR_ITEM_UPLOADS_DIR));
-
-// ---- Upload a new T-Shirt/Shirt/Pants/Face (Studio Creations -> Avatar Items) ----
-// Accepts png/jpg, max 5MB. Free - no Robux cost, same as Sounds/Decals.
-app.post('/avatar-items/:category/upload', (req, res) => {
-    const category = (req.params.category || '').toString().toLowerCase().trim();
-    if (!AVATAR_ITEM_CATEGORIES.includes(category)) {
-        return res.status(400).json({ error: 'invalid-category', message: 'Not a valid avatar item category.' });
-    }
-    avatarItemUpload.single('file')(req, res, (err) => {
-        if (err) {
-            if (err.code === 'LIMIT_FILE_SIZE') {
-                return res.status(400).json({ error: 'file-too-large', message: 'Avatar items can\'t be over 5MB.' });
-            }
-            console.error('Avatar item upload error:', err);
-            return res.status(500).json({ error: 'upload-failed', message: 'Something went wrong uploading that item.' });
-        }
-        try {
-            const account = findAccountByUsername((req.body.username || '').toString());
-            if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found. Log in to upload avatar items.' });
-            if (liftBanIfExpired(account)) saveAccountsIndex();
-            if (account.banned) return res.status(403).json({ error: 'banned', message: 'Banned accounts cannot upload avatar items.' });
-
-            if (AVATAR_ITEM_ADMIN_ONLY_CATEGORIES.includes(category) && !isAdminUsername(account.username)) {
-                return res.status(403).json({ error: 'admin-only-category', message: 'Only admins can upload faces.' });
-            }
-
-            const name = (req.body.name || '').toString().trim().slice(0, 60) || 'Untitled';
-            const description = (req.body.description || '').toString().trim().slice(0, 1000);
-
-            if (!req.file) return res.status(400).json({ error: 'no-file', message: 'A PNG or JPG file is required.' });
-            const mime = (req.file.mimetype || '').toLowerCase();
-            const ext = AVATAR_ITEM_ALLOWED_MIMES[mime];
-            if (!ext) {
-                return res.status(400).json({ error: 'invalid-file-type', message: 'Avatar items must be a PNG or JPG file.' });
-            }
-
-            const visibility = (req.body.visibility || '').toString().toLowerCase().trim() === 'private' ? 'private' : 'public';
-
-            const id = nextAvatarItemId++;
-            saveAvatarItemIdCounter();
-
-            const filename = `${id}.${ext}`;
-            fs.writeFileSync(path.join(AVATAR_ITEM_UPLOADS_DIR, filename), req.file.buffer);
-
-            const item = {
-                id, name, description, category, filename,
-                creator: account.username,
-                visibility,
-                createdAt: Date.now(),
-                deleted: false
-            };
-            avatarItems.push(item);
-            saveAvatarItemsIndex();
-
-            res.json({ success: true, item: publicAvatarItem(item) });
-        } catch (err2) {
-            console.error('Avatar item upload error:', err2);
-            res.status(500).json({ error: 'upload-failed', message: 'Something went wrong uploading that item.' });
-        }
-    });
-});
-
-// ---- List every T-Shirt/Shirt/Pants/Face a player has uploaded (Studio Creations -> Avatar Items) ----
-// Returns all 4 categories together (client filters by category, same pattern the old
-// /accounts/:username/catalog-items endpoint used for Accessories/Clothes).
-app.get('/accounts/:username/avatar-items', (req, res) => {
-    const account = findAccountByUsername(req.params.username);
-    if (!account) return res.status(404).json({ error: 'no-account', message: 'Account not found.' });
-    const list = avatarItems
-        .filter(i => !i.deleted && i.creator.toLowerCase() === account.username.toLowerCase())
-        .map(publicAvatarItem);
-    res.json({ items: list });
-});
-
-// Same "only the creator may touch this" gate as requireAssetOwner() above.
-function requireAvatarItemOwner(req, res, item) {
-    const username = (req.body.username || req.query.username || '').toString().trim();
-    if (!username || username.toLowerCase() !== (item.creator || '').toString().trim().toLowerCase()) {
-        res.status(403).json({ error: 'not-owner', message: 'Only this item\'s creator can change it.' });
-        return false;
-    }
-    return true;
-}
-
-// ---- Rename a T-Shirt/Shirt/Pants/Face ----
-app.post('/avatar-items/:id/rename', (req, res) => {
-    const item = findAvatarItemById(req.params.id);
-    if (!item || item.deleted) return res.status(404).json({ error: 'not-found', message: 'That item does not exist.' });
-    if (!requireAvatarItemOwner(req, res, item)) return;
-    const name = (req.body.name || '').toString().trim();
-    if (!name) return res.status(400).json({ error: 'invalid-name', message: 'Name cannot be empty.' });
-    item.name = name.slice(0, 60);
-    saveAvatarItemsIndex();
-    res.json({ success: true, item: publicAvatarItem(item) });
-});
-
-// ---- Change a T-Shirt/Shirt/Pants/Face's description ----
-app.post('/avatar-items/:id/description', (req, res) => {
-    const item = findAvatarItemById(req.params.id);
-    if (!item || item.deleted) return res.status(404).json({ error: 'not-found', message: 'That item does not exist.' });
-    if (!requireAvatarItemOwner(req, res, item)) return;
-    const description = (req.body.description || '').toString().trim().slice(0, 1000);
-    item.description = description;
-    saveAvatarItemsIndex();
-    res.json({ success: true, item: publicAvatarItem(item) });
-});
-
-// ---- Change a T-Shirt/Shirt/Pants/Face's visibility (public/private) ----
-app.post('/avatar-items/:id/visibility', (req, res) => {
-    const item = findAvatarItemById(req.params.id);
-    if (!item || item.deleted) return res.status(404).json({ error: 'not-found', message: 'That item does not exist.' });
-    if (!requireAvatarItemOwner(req, res, item)) return;
-    const visibility = (req.body.visibility || '').toString().toLowerCase().trim();
-    if (visibility !== 'public' && visibility !== 'private') {
-        return res.status(400).json({ error: 'invalid-visibility', message: 'Visibility must be "public" or "private".' });
-    }
-    item.visibility = visibility;
-    saveAvatarItemsIndex();
-    res.json({ success: true, item: publicAvatarItem(item) });
-});
-
-// ---- Replace a T-Shirt/Shirt/Pants/Face's image ----
-app.post('/avatar-items/:id/image', (req, res) => {
-    avatarItemUpload.single('file')(req, res, (err) => {
-        if (err) {
-            if (err.code === 'LIMIT_FILE_SIZE') {
-                return res.status(400).json({ error: 'file-too-large', message: 'Avatar items can\'t be over 5MB.' });
-            }
-            console.error('Avatar item image error:', err);
-            return res.status(500).json({ error: 'upload-failed', message: 'Something went wrong changing that image.' });
-        }
-        const item = findAvatarItemById(req.params.id);
-        if (!item || item.deleted) return res.status(404).json({ error: 'not-found', message: 'That item does not exist.' });
-        if (!requireAvatarItemOwner(req, res, item)) return;
-
-        if (!req.file) return res.status(400).json({ error: 'no-file', message: 'A PNG or JPG file is required.' });
-        const mime = (req.file.mimetype || '').toLowerCase();
-        const ext = AVATAR_ITEM_ALLOWED_MIMES[mime];
-        if (!ext) {
-            return res.status(400).json({ error: 'invalid-file-type', message: 'Avatar items must be a PNG or JPG file.' });
-        }
-
-        try {
-            const oldPath = path.join(AVATAR_ITEM_UPLOADS_DIR, item.filename);
-            if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
-        } catch (e) {
-            console.error('Failed to remove old avatar item image:', e);
-        }
-
-        const filename = `${item.id}.${ext}`;
-        fs.writeFileSync(path.join(AVATAR_ITEM_UPLOADS_DIR, filename), req.file.buffer);
-        item.filename = filename;
-
-        saveAvatarItemsIndex();
-        res.json({ success: true, item: publicAvatarItem(item) });
-    });
-});
-
-// ---- Permanently delete a T-Shirt/Shirt/Pants/Face (Creations -> "..." settings -> Delete Forever) ----
-app.delete('/avatar-items/:id', (req, res) => {
-    const item = findAvatarItemById(req.params.id);
-    if (!item || item.deleted) return res.status(404).json({ error: 'not-found', message: 'That item does not exist.' });
-    if (!requireAvatarItemOwner(req, res, item)) return;
-    try {
-        const filePath = path.join(AVATAR_ITEM_UPLOADS_DIR, item.filename);
-        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-    } catch (err) {
-        console.error('Failed to remove avatar item image on delete:', err);
-    }
-    item.deleted = true;
-    saveAvatarItemsIndex();
     res.json({ success: true });
 });
 
