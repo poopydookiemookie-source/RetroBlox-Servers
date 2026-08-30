@@ -961,6 +961,29 @@ app.post('/badges/:id/description', (req, res) => {
     res.json({ success: true, badge: publicBadge(badge) });
 });
 
+// ---- Reassign a badge to a different game (Creations -> badge's "..." settings -> Game) ----
+// Only the badge's creator can move it, and only onto a game that same account also
+// owns - same ownership rule /games/:id/badges enforces when a badge is first created,
+// just re-checked here against the *new* gameId instead of the one it already has.
+app.post('/badges/:id/game', (req, res) => {
+    const badge = findBadgeById(req.params.id);
+    if (!badge) return res.status(404).json({ error: 'no-badge', message: 'Badge not found.' });
+    if (!requireBadgeOwner(req, res, badge)) return;
+
+    const gameId = (req.body.gameId || '').toString().trim();
+    const game = games.find(g => g.id === gameId);
+    if (!game) return res.status(404).json({ error: 'no-game', message: 'Game not found.' });
+
+    const username = (req.body.username || '').toString().trim();
+    if (game.creator.toLowerCase() !== username.toLowerCase()) {
+        return res.status(403).json({ error: 'not-owner', message: 'You can only assign badges to games you own.' });
+    }
+
+    badge.gameId = game.id;
+    saveBadgesIndex();
+    res.json({ success: true, badge: publicBadge(badge) });
+});
+
 // ---- Replace a badge's icon image (Creations -> badge's "..." settings -> Change Image) ----
 app.post('/badges/:id/image', badgeIconUpload.single('icon'), (req, res) => {
     const badge = findBadgeById(req.params.id);
