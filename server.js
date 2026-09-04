@@ -4010,6 +4010,38 @@ app.get('/games/:id/instances', (req, res) => {
     res.json({ gameId: g.id, maxPlayers: cap, instances });
 });
 
+// ================= PHYSICS OWNERSHIP (unanchored-part sync during Play mode) =================
+// Real Roblox distributes physics ownership per-part/assembly across clients and the
+// server. This engine's "server" is just a relay (see the room model above/below) with no
+// real Lua/physics budget of its own, so instead of per-part ownership, one CLIENT per
+// game room is elected HOST and its Rapier simulation is the sole authority for every
+// unanchored part in that room - every other client receives that host's periodic
+// position/rotation/velocity snapshots (partSync, throttled client-side) and forcibly
+// corrects its own local bodies to match, rather than trusting its own local sim's result
+// for anything network-owned. Mirrors studioSessionHost's "first joiner is host, re-elect
+// on disconnect" pattern above, but keyed by the actual game ROOM (gameId#instance, or the
+// studio_<sessionId> Play-Together room) rather than the raw studio sessionId - this is
+// the same room joinGame/updateState/peerUpdate already operate on, so it works uniformly
+// for a real published game's players AND a Play-Together session's playtesters.
+const physicsHostByRoom = {}; // room -> socketId of the current physics host
+
+// Elects (or re-confirms) the physics host for a room, called once a socket has actually
+// joined it (right after gameStates[room][socket.id] is populated in joinGame above) -
+// first person into an empty room becomes host; everyone else just gets told who already
+// is. Falls back to re-electing from whoever's left if the recorded host has since left
+// the room without a clean 'leaveGame' (same staleness guard studioJoinSession uses for
+// studioSessionHost).
+function electPhysicsHostIfNeeded(room) {
+    const inRoom = gameStates[room] ? Object.keys(gameStates[room]) : [];
+    if (inRoom.length === 0) { delete physicsHostByRoom[room]; return null; }
+    let hostId = physicsHostByRoom[room];
+    if (!hostId || !gameStates[room][hostId]) {
+        hostId = inRoom[0];
+        physicsHostByRoom[room] = hostId;
+    }
+    return hostId;
+}
+
 io.on('connection', (socket) => {
     // ---- Site presence: client emits this once on connect (and again after a ----
     // ---- reconnect) so friends can be shown "online" even outside a game.    ----
@@ -4084,6 +4116,16 @@ io.on('connection', (socket) => {
         // is new info the old flat-gameId flow never needed to send back.
         socket.emit('currentPlayers', gameStates[room]);
         socket.emit('joinedInstance', { gameId, room, instance: room.includes(INSTANCE_SEP) ? parseInt(room.slice(gameId.length + 1), 10) : null });
+
+        // Physics host election - see electPhysicsHostIfNeeded's own comment above.
+        // Tell EVERYONE in the room (not just the joiner) who's host: if this join is
+        // what just formed the room, the joiner itself needs to know it's now host;
+        // if a later joiner arrives, nothing actually changes here, but re-broadcasting
+        // is harmless and keeps every client's local "who's host" state honest even if
+        // one of them missed an earlier message (reconnect, etc).
+        const hostId = electPhysicsHostIfNeeded(room);
+        if (hostId) io.to(room).emit('physicsHost', { hostId });
+
         updateGlobalCounts();
     });
 
@@ -4093,6 +4135,44 @@ socket.on('updateState', (data) => {
             Object.assign(gameStates[room][socket.id], data);
             socket.to(room).emit('peerUpdate', { id: socket.id, ...data });
         }
+    });
+
+    // ---- Physics ownership: unanchored-part sync. See the "PHYSICS OWNERSHIP" ----
+    // ---- block above for the full model - two events, both pure relays (the ----
+    // ---- server does no physics of its own, same as everywhere else in this file): ----
+    //
+    // 'partSync' - sent ONLY by whichever socket is physicsHostByRoom[room] for this
+    // room (a non-host sending this is silently ignored, since trusting a non-host's
+    // physics would let two clients' local sims fight over the same parts - the
+    // client is expected to gate this itself by checking the 'physicsHost' event it
+    // received, but the server re-checks here too rather than trusting the client).
+    // Payload is an array of {id, pos, quat, linvel, angvel} snapshots, id being the
+    // part's engine uuid (the same id getObjectById resolves everywhere else) - kept
+    // as one batched array rather than one event per part so a room with many
+    // unanchored parts doesn't flood socket.io with hundreds of tiny emits per tick.
+    // Relayed verbatim to everyone else in the room; the host's own client already
+    // has the true local state and doesn't need it echoed back.
+    socket.on('partSync', (snapshots) => {
+        const room = Array.from(socket.rooms).find(r => gameStates[r]);
+        if (!room || !Array.isArray(snapshots)) return;
+        if (physicsHostByRoom[room] !== socket.id) return;
+        socket.to(room).emit('partSync', snapshots);
+    });
+
+    // 'partForce' - Stage B: sent by a NON-host client when its local player touches/
+    // pushes an unanchored part it doesn't own, so the actual physics response happens
+    // once, in the host's real simulation, instead of each client guessing independently
+    // and drifting apart. Routed point-to-point straight to the current host (not
+    // broadcast to the room - nobody else needs to see a request that hasn't been
+    // resolved into a real position update yet; the host's own next partSync batch
+    // covers that). Silently dropped if there's no host on file yet (room mid-formation)
+    // or if the sender IS the host (the host doesn't need to ask itself).
+    socket.on('partForce', (data) => {
+        const room = Array.from(socket.rooms).find(r => gameStates[r]);
+        if (!room || !data) return;
+        const hostId = physicsHostByRoom[room];
+        if (!hostId || hostId === socket.id) return;
+        io.to(hostId).emit('partForce', { fromId: socket.id, ...data });
     });
 
     // ---- Appearance changed mid-session (e.g. player swaps a hat/shirt while playing) ----
@@ -4140,6 +4220,14 @@ socket.on('updateState', (data) => {
             if (gameStates[room] && gameStates[room][socket.id]) {
                 delete gameStates[room][socket.id];
                 socket.to(room).emit('playerLeft', socket.id);
+                // If the physics host itself just left, re-elect from whoever's left
+                // and tell them - electPhysicsHostIfNeeded returns null if the room
+                // is now empty (about to be destroyed by destroyRoomIfEmpty below
+                // anyway), in which case there's no one left to notify.
+                if (physicsHostByRoom[room] === socket.id) {
+                    const newHostId = electPhysicsHostIfNeeded(room);
+                    if (newHostId) io.to(room).emit('physicsHost', { hostId: newHostId });
+                }
                 destroyRoomIfEmpty(room);
             }
         });
